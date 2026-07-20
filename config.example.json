@@ -9,7 +9,7 @@
     "request_timeout_seconds": 60
   },
   "wholesale_defaults": {
-    "recalculate_on_current_price": true,
+    "recalculate_from_rrc": true,
     "rules": [
       { "tier": 1, "minimal_threshold": 2, "discount_percent": 10 },
       { "tier": 2, "minimal_threshold": 5, "discount_percent": 15 },

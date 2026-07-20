@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from horoshop_prices import (
-    CatalogIndex, Credentials, HoroshopClient, HoroshopPricesError, PricePlan, PriceRow, Settings,
+    CatalogIndex, Credentials, FieldChange, HoroshopClient, HoroshopPricesError, PricePlan, PriceRow, Settings, WholesaleChange,
     build_excel_template, import_results, load_settings, normalize, parse_decimal, parse_excel_prices, parse_price_type, parse_threshold, plan_prices,
 )
 
@@ -80,10 +80,24 @@ def catalog_for(credentials: Credentials) -> tuple[CatalogIndex, HoroshopClient]
 
 
 def serialise(plan: PricePlan, status: str | None = None, message: str = "") -> dict[str, Any]:
+    row = plan.rows[0]
+    changes: list[str] = []
+    if row.current.value is not None:
+        changes.append(f"Поточна ціна: {row.current.value}")
+    if row.old.value is not None:
+        changes.append(f"РРЦ: {row.old.value}")
+    elif row.old.delete:
+        changes.append("РРЦ: видалити")
+    if row.move_current_to_old:
+        changes.append("Поточну ціну перенести в РРЦ")
+    for wholesale in row.wholesale:
+        label = f"Опт {wholesale.tier}" + (f" від {wholesale.threshold} шт." if wholesale.threshold else "")
+        changes.append(label + (": видалити" if wholesale.change.delete else f": {wholesale.change.value}"))
     return {
         "article": plan.display_article,
         "internal_article": plan.article,
-        "rows": [{"row_number": row.row_number, "price_type": row.price_type, "value": str(row.value), "threshold": row.threshold} for row in plan.rows],
+        "row_number": row.row_number,
+        "changes": changes,
         "status": status or ("ready" if plan.ready else "invalid"),
         "message": message or plan.error or "; ".join(plan.warnings),
     }
@@ -168,7 +182,16 @@ async def one_price(request: Request) -> dict[str, Any]:
     try:
         data = await request.json()
         price_type = parse_price_type(data.get("price_type"))
-        row = PriceRow(normalize(data.get("article")), price_type, parse_decimal(data.get("value"), allow_zero=price_type == "price_old"), parse_threshold(data.get("threshold")), 1)
+        raw_value = normalize(data.get("value"))
+        delete = raw_value.casefold() in {"видалити", "delete"}
+        if delete and price_type == "price":
+            raise ValueError("Поточну ціну не можна видалити. Вкажіть нове значення.")
+        value = None if delete else parse_decimal(raw_value)
+        threshold = parse_threshold(data.get("threshold"))
+        current = FieldChange(value=value) if price_type == "price" else FieldChange()
+        old = FieldChange(value=value, delete=delete) if price_type == "price_old" else FieldChange()
+        wholesale = () if not price_type.startswith("wholesale_") else (WholesaleChange(int(price_type.rsplit("_", 1)[1]), FieldChange(value=value, delete=delete), threshold),)
+        row = PriceRow(normalize(data.get("article")), current, old, False, wholesale, 1)
         return await asyncio.to_thread(execute_rows, [row], credentials_from(data))
     except (HoroshopPricesError, ValueError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

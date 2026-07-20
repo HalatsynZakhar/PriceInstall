@@ -48,7 +48,7 @@ class Settings:
     public_log_path: Path
     public_log_name: str
     wholesale_rules: tuple[WholesaleRule, ...]
-    recalculate_wholesale_on_current_price: bool
+    recalculate_wholesale_from_rrc: bool
 
     @property
     def public_log_file(self) -> Path:
@@ -63,11 +63,29 @@ class Credentials:
 
 
 @dataclass(frozen=True)
+class FieldChange:
+    value: Decimal | None = None
+    delete: bool = False
+
+    @property
+    def specified(self) -> bool:
+        return self.value is not None or self.delete
+
+
+@dataclass(frozen=True)
+class WholesaleChange:
+    tier: int
+    change: FieldChange
+    threshold: int | None = None
+
+
+@dataclass(frozen=True)
 class PriceRow:
     display_article: str
-    price_type: str
-    value: Decimal
-    threshold: int | None
+    current: FieldChange
+    old: FieldChange
+    move_current_to_old: bool
+    wholesale: tuple[WholesaleChange, ...]
     row_number: int
 
 
@@ -190,35 +208,102 @@ def load_settings(config_file: Path) -> Settings:
         port=max(1, min(65535, int(server.get("port", 8095)))), batch_size=max(1, int(horoshop.get("batch_size", 50))),
         request_timeout_seconds=max(1, int(horoshop.get("request_timeout_seconds", 60))), public_log_path=path, public_log_name=name,
         wholesale_rules=tuple(sorted(rules, key=lambda rule: rule.tier)),
-        recalculate_wholesale_on_current_price=bool(prices.get("recalculate_on_current_price", True)) if isinstance(prices, dict) else True,
+        recalculate_wholesale_from_rrc=bool(prices.get("recalculate_from_rrc", prices.get("recalculate_on_current_price", True))) if isinstance(prices, dict) else True,
     )
+
+
+DELETE_MARKERS = {"видалити", "delete", "так", "yes"}
+YES_MARKERS = {"так", "да", "yes", "1"}
+HEADER_ARTICLE = {"артикул", "артикул для відображення", "article", "article_for_display"}
+
+
+def header_key(value: Any) -> str:
+    return " ".join(normalize(value).casefold().split())
+
+
+def parse_change(value: Any, label: str) -> FieldChange:
+    text = normalize(value)
+    if not text:
+        return FieldChange()
+    if text.casefold() in DELETE_MARKERS:
+        return FieldChange(delete=True)
+    return FieldChange(value=parse_decimal(text, label))
+
+
+def parse_yes(value: Any, label: str) -> bool:
+    text = normalize(value)
+    if not text or text.casefold() in {"ні", "нет", "no", "0"}:
+        return False
+    if text.casefold() in YES_MARKERS:
+        return True
+    raise ValueError(f"у колонці «{label}» вкажіть Так або залиште порожньою.")
+
+
+def column_map(headers: tuple[Any, ...]) -> dict[str, int]:
+    mapping: dict[str, int] = {}
+    aliases = {"поточна ціна": "price", "ррц": "old", "поточну ціну в ррц (так)": "move"}
+    for tier in range(1, 6):
+        aliases[f"опт {tier}"] = f"wholesale_{tier}"
+        aliases[f"опт {tier} від"] = f"threshold_{tier}"
+    for index, value in enumerate(headers):
+        key = header_key(value)
+        target = "article" if key in HEADER_ARTICLE else aliases.get(key)
+        if target:
+            if target in mapping:
+                raise ValueError(f"Заголовок «{value}» повторюється.")
+            mapping[target] = index
+    if "article" not in mapping:
+        raise ValueError("Не знайдено обов'язковий стовпець «Артикул».")
+    return mapping
+
+
+def cell(row: tuple[Any, ...], mapping: dict[str, int], key: str) -> Any:
+    index = mapping.get(key)
+    return row[index] if index is not None and index < len(row) else None
 
 
 def parse_excel_prices(data: bytes) -> list[PriceRow]:
     workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     try:
         worksheet = workbook.worksheets[0]
+        iterator = worksheet.iter_rows(values_only=True)
+        try:
+            headers = next(iterator)
+        except StopIteration as error:
+            raise ValueError("Excel-файл порожній.") from error
+        mapping = column_map(headers)
         rows: list[PriceRow] = []
-        headers = {"артикул", "артикул для відображення", "article", "article_for_display"}
-        for row_number, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
-            if not row or all(value is None for value in row[:4]):
-                continue
-            article = normalize(row[0] if len(row) > 0 else "")
-            if article.casefold() in headers:
+        for row_number, row in enumerate(iterator, start=2):
+            if not row or all(value is None for value in row):
                 continue
             try:
+                article = normalize(cell(row, mapping, "article"))
                 if not article:
                     raise ValueError("вкажіть артикул.")
-                price_type = parse_price_type(row[1] if len(row) > 1 else "")
-                value = parse_decimal(row[2] if len(row) > 2 else "", allow_zero=price_type == "price_old")
-                threshold = parse_threshold(row[3] if len(row) > 3 else "")
-                if not price_type.startswith("wholesale_") and threshold is not None:
-                    raise ValueError("кількість від заповнюється тільки для оптової ціни.")
+                current = parse_change(cell(row, mapping, "price"), "Поточна ціна")
+                if current.delete:
+                    raise ValueError("поточну ціну не можна видалити. Вкажіть нове значення.")
+                old = parse_change(cell(row, mapping, "old"), "РРЦ")
+                move = parse_yes(cell(row, mapping, "move"), "Поточну ціну в РРЦ (Так)")
+                if move and old.specified:
+                    raise ValueError("не поєднуйте РРЦ та «Поточну ціну в РРЦ (Так)» в одному рядку.")
+                if move and current.value is None:
+                    raise ValueError("для перенесення поточної ціни в РРЦ вкажіть нову «Поточну ціну».")
+                wholesale: list[WholesaleChange] = []
+                for tier in range(1, 6):
+                    change = parse_change(cell(row, mapping, f"wholesale_{tier}"), f"Опт {tier}")
+                    threshold = parse_threshold(cell(row, mapping, f"threshold_{tier}"))
+                    if threshold is not None and not change.specified:
+                        raise ValueError(f"для Опт {tier} задано кількість без ціни або команди «Видалити».")
+                    if change.specified:
+                        wholesale.append(WholesaleChange(tier, change, threshold))
+                if not current.specified and not old.specified and not move and not wholesale:
+                    continue
+                rows.append(PriceRow(article, current, old, move, tuple(wholesale), row_number))
             except ValueError as error:
                 raise ValueError(f"Рядок {row_number}: {error}") from error
-            rows.append(PriceRow(article, price_type, value, threshold, row_number))
         if not rows:
-            raise ValueError("Excel не містить жодної ціни.")
+            raise ValueError("У файлі немає жодної команди. Порожні клітинки не змінюють ціни.")
         return rows
     finally:
         workbook.close()
@@ -235,13 +320,16 @@ def build_excel_template() -> bytes:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Ціни"
-    sheet.append(["Артикул для відображення", "Тип ціни", "Значення", "Кількість від (лише для Опт 4-5)"])
+    headers = ["Артикул", "Поточна ціна", "РРЦ", "Поточну ціну в РРЦ (Так)"]
+    for tier in range(1, 6):
+        headers.extend([f"Опт {tier}", f"Опт {tier} від"])
+    sheet.append(headers)
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = "A1:D1"
-    for column, width in {"A": 30, "B": 24, "C": 16, "D": 32}.items():
+    sheet.auto_filter.ref = "A1:N1"
+    for column, width in {"A": 28, "B": 16, "C": 16, "D": 28, "E": 14, "F": 14, "G": 14, "H": 14, "I": 14, "J": 14, "K": 14, "L": 14, "M": 14, "N": 14}.items():
         sheet.column_dimensions[column].width = width
     _style_header(sheet)
-    examples = [("01063", "Поточна ціна", 1000, ""), ("01063", "РРЦ", 1200, ""), ("01063", "Опт 4", 700, 20)]
+    examples = [("01063", 750, "", "Так", "", "", "", "", "", "", 650, 20, "", "")]
     for row in examples:
         sheet.append(row)
     for row in range(2, 202):
@@ -253,12 +341,14 @@ def build_excel_template() -> bytes:
     guide["A1"].fill = PatternFill("solid", fgColor="6D3B8F")
     guide.merge_cells("A1:B1")
     notes = [
-        "Кожен рядок оновлює один тип ціни одного товару. Один товар може мати кілька рядків.",
+        "Один рядок = один товар. Кожен стовпець керує окремою ціною цього товару.",
         "Артикул можна вказати як article_for_display зі сайту або внутрішній article Хорошоп. Пошук: точний, потім без урахування регістру.",
-        "Типи: Поточна ціна, РРЦ, Опт 1, Опт 2, Опт 3, Опт 4, Опт 5.",
-        "Для поточної ціни за замовчуванням опт 1-3 перераховується за правилами 2 шт. -10%, 5 шт. -15%, 10 шт. -25%. Правила можна змінити у config.json.",
-        "Оптові ціни з ціною не нижче поточної автоматично виключаються. Інші наявні рівні опта зберігаються.",
-        "Для Опт 4-5 заповніть «Кількість від». Для Опт 1-3 поріг береться з config.json, якщо колонка порожня.",
+        "Порожня клітинка означає «не змінювати». Видалення виконується тільки словом «Видалити» у клітинці РРЦ або потрібного Опт 1-5.",
+        "«Поточну ціну в РРЦ (Так)»: коли вказано нову поточну ціну, попередня поточна ціна буде записана в РРЦ. Не заповнюйте при цьому стовпець РРЦ.",
+        "Опт 1-3 розраховується від РРЦ/старої ціни за правилами 2 шт. -10%, 5 шт. -15%, 10 шт. -25%. Правила можна змінити у config.json.",
+        "Акційна ціна не зменшує опт. Оптові ціни, які не нижчі за поточну ціну, автоматично виключаються. Інші наявні рівні опта зберігаються.",
+        "Для будь-якого Опт 1-5 можна вказати «Кількість від». Якщо для Опт 1-3 вона порожня, поріг береться з config.json. Для Опт 4-5 кількість обов'язкова.",
+        "Стовпці можна переставляти. Якщо необов'язковий стовпець видалено, він не буде змінюватися. Стовпець «Артикул» обов'язковий.",
     ]
     for index, note in enumerate(notes, start=3):
         guide.cell(index, 1, note).alignment = Alignment(wrap_text=True, vertical="top")
@@ -334,44 +424,56 @@ def wholesale_entries(existing: tuple[dict[str, Any], ...]) -> dict[int, Decimal
 
 
 def plan_prices(rows: list[PriceRow], catalog: CatalogIndex, settings: Settings) -> list[PricePlan]:
-    grouped: dict[str, list[PriceRow]] = {}
+    grouped: dict[str, PriceRow] = {}
     errors: list[PricePlan] = []
     for row in rows:
         product, error = catalog.resolve(row.display_article)
         if error or product is None:
             errors.append(PricePlan("", row.display_article, {}, (row,), error=error))
+        elif product.article in grouped:
+            errors.append(PricePlan(product.article, product.display_article or product.article, {}, (row,), error="Артикул повторюється у файлі. Для товару має бути лише один рядок."))
         else:
-            grouped.setdefault(product.article, []).append(row)
+            grouped[product.article] = row
     plans = errors
-    for article, article_rows in grouped.items():
+    for article, row in grouped.items():
         product = catalog.by_article[article]
         current = product.price
         old = product.price_old
-        direct_wholesale = any(row.price_type.startswith("wholesale_") for row in article_rows)
-        has_current = any(row.price_type == "price" for row in article_rows)
-        for row in article_rows:
-            if row.price_type == "price": current = row.value
-            elif row.price_type == "price_old": old = row.value
+        has_current = row.current.value is not None
+        has_old = row.old.specified or row.move_current_to_old
+        direct_wholesale = bool(row.wholesale)
+        if has_current:
+            current = row.current.value
+        if row.move_current_to_old:
+            old = product.price
+        elif row.old.delete:
+            old = None
+        elif row.old.value is not None:
+            old = row.old.value
         if current is None:
-            plans.append(PricePlan(article, product.display_article or article, {}, tuple(article_rows), error="Немає поточної ціни: спочатку встановіть «Поточна ціна»."))
+            plans.append(PricePlan(article, product.display_article or article, {}, (row,), error="Немає поточної ціни: спочатку встановіть «Поточна ціна«."))
             continue
         wholesale = wholesale_entries(product.wholesale_prices)
         warnings: list[str] = []
-        if has_current and settings.recalculate_wholesale_on_current_price:
+        if (has_current or has_old) and settings.recalculate_wholesale_from_rrc and old is not None:
             for rule in settings.wholesale_rules:
                 if rule.tier <= 3:
-                    wholesale[rule.minimal_threshold] = (current * (Decimal("100") - rule.discount_percent) / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            warnings.append("Опт 1-3 перераховано за правилами за замовчуванням.")
-        for row in article_rows:
-            if not row.price_type.startswith("wholesale_"):
-                continue
-            tier = int(row.price_type.rsplit("_", 1)[1])
+                    wholesale[rule.minimal_threshold] = (old * (Decimal("100") - rule.discount_percent) / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            warnings.append("Опт 1-3 розраховано від РРЦ за правилами за замовчуванням.")
+        for wholesale_change in row.wholesale:
+            tier = wholesale_change.tier
             rule = rule_for(settings, tier)
-            threshold = row.threshold or (rule.minimal_threshold if rule else None)
+            threshold = wholesale_change.threshold or (rule.minimal_threshold if rule else None)
             if threshold is None:
-                plans.append(PricePlan(article, product.display_article or article, {}, tuple(article_rows), error=f"Для Опт {tier} вкажіть «Кількість від" + "."))
+                plans.append(PricePlan(article, product.display_article or article, {}, (row,), error=f"Для Опт {tier} вкажіть «Кількість від»."))
                 break
-            wholesale[threshold] = row.value
+            if rule is not None and threshold != rule.minimal_threshold:
+                wholesale.pop(rule.minimal_threshold, None)
+            if wholesale_change.change.delete:
+                wholesale.pop(threshold, None)
+                warnings.append(f"Видалено Опт {tier} від {threshold} шт.")
+            else:
+                wholesale[threshold] = wholesale_change.change.value  # type: ignore[index]
         else:
             invalid = [threshold for threshold, value in wholesale.items() if value >= current]
             for threshold in invalid:
@@ -379,11 +481,11 @@ def plan_prices(rows: list[PriceRow], catalog: CatalogIndex, settings: Settings)
             if invalid:
                 warnings.append("Вимкнено оптові рівні, де ціна не нижча за поточну: " + ", ".join(map(str, sorted(invalid))) + ".")
             payload: dict[str, Any] = {"article": article}
-            if any(row.price_type == "price" for row in article_rows): payload["price"] = float(current)
-            if any(row.price_type == "price_old" for row in article_rows): payload["price_old"] = float(old) if old else 0
+            if has_current: payload["price"] = float(current)
+            if has_old: payload["price_old"] = float(old) if old else 0
             if has_current or direct_wholesale:
                 payload["wholesale_prices"] = [{"minimal_threshold": threshold, "price": float(value)} for threshold, value in sorted(wholesale.items())]
-            plans.append(PricePlan(article, product.display_article or article, payload, tuple(article_rows), tuple(warnings)))
+            plans.append(PricePlan(article, product.display_article or article, payload, (row,), tuple(warnings)))
     return sorted(plans, key=lambda plan: min(row.row_number for row in plan.rows))
 
 
