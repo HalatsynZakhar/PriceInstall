@@ -1,0 +1,23 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8095
+  },
+  "horoshop": {
+    "domain": "https://your-shop.example.com",
+    "batch_size": 50,
+    "request_timeout_seconds": 60
+  },
+  "wholesale_defaults": {
+    "recalculate_on_current_price": true,
+    "rules": [
+      { "tier": 1, "minimal_threshold": 2, "discount_percent": 10 },
+      { "tier": 2, "minimal_threshold": 5, "discount_percent": 15 },
+      { "tier": 3, "minimal_threshold": 10, "discount_percent": 25 }
+    ]
+  },
+  "logging": {
+    "public_log_path": "C:\\ShareFiles\\public",
+    "public_log_name": "horoshop_prices.log"
+  }
+}

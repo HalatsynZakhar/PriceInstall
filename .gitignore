@@ -1,0 +1,7 @@
+.venv/
+.idea/workspace.xml
+__pycache__/
+*.py[cod]
+data/
+logs/
+config.json
