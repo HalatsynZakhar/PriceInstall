@@ -30,27 +30,32 @@ class HoroshopPricesTests(unittest.TestCase):
         return CatalogIndex.from_raw([{"article":"REAL-1","article_for_display":"Display-1","price":1000,"price_old":1000,"wholesale_prices":[{"minimal_threshold":2,"price":900},{"minimal_threshold":20,"price":700}]}])
 
     def test_sale_price_disables_wholesale_price_above_it(self):
-        row = PriceRow("Display-1", FieldChange(Decimal("750")), FieldChange(), False, False, (), 2)
+        row = PriceRow("Display-1", FieldChange(Decimal("750")), None, FieldChange(), False, False, (), 2)
         plan = plan_prices([row], self.catalog(), self.settings())[0]
         self.assertEqual(plan.payload["wholesale_prices"], [{"minimal_threshold": 20, "price": 700.0}])
         self.assertIn("Вимкнено", "; ".join(plan.warnings))
 
     def test_moves_existing_current_price_to_rrc(self):
-        row = PriceRow("REAL-1", FieldChange(Decimal("800")), FieldChange(), True, False, (), 2)
+        row = PriceRow("REAL-1", FieldChange(Decimal("800")), None, FieldChange(), True, False, (), 2)
         plan = plan_prices([row], self.catalog(), self.settings())[0]
         self.assertEqual(plan.payload["price"], 800.0)
         self.assertEqual(plan.payload["price_old"], 1000.0)
 
     def test_explicit_delete_is_different_from_blank(self):
-        row = PriceRow("REAL-1", FieldChange(), FieldChange(delete=True), False, False, (WholesaleChange(1, FieldChange(delete=True)),), 2)
+        row = PriceRow("REAL-1", FieldChange(), None, FieldChange(delete=True), False, False, (WholesaleChange(1, FieldChange(delete=True)),), 2)
         plan = plan_prices([row], self.catalog(), self.settings())[0]
         self.assertEqual(plan.payload["price_old"], 0)
         self.assertEqual(plan.payload["wholesale_prices"], [{"minimal_threshold": 20, "price": 700.0}])
 
     def test_moves_rrc_to_current_price(self):
-        row = PriceRow("REAL-1", FieldChange(), FieldChange(), False, True, (), 2)
+        row = PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, True, (), 2)
         plan = plan_prices([row], self.catalog(), self.settings())[0]
         self.assertEqual(plan.payload["price"], 1000.0)
+
+    def test_current_price_can_be_calculated_as_fractional_percent_of_rrc(self):
+        row = PriceRow("REAL-1", FieldChange(), Decimal("75.6"), FieldChange(), False, False, (), 2)
+        plan = plan_prices([row], self.catalog(), self.settings())[0]
+        self.assertEqual(plan.payload["price"], 756.0)
 
     def test_excel_supports_one_row_and_reordered_columns(self):
         rows = parse_excel_prices(self.excel(["Опт 1", "Артикул", "Поточна ціна", "Поточну ціну в РРЦ (Так)", "Опт 1 від"], [(800, "A", 900, "Так", 3)]))
@@ -74,7 +79,8 @@ class HoroshopPricesTests(unittest.TestCase):
         workbook = load_workbook(io.BytesIO(build_excel_template()), read_only=True)
         headers = [cell.value for cell in next(workbook["Ціни"].iter_rows(max_row=1))]
         self.assertIn("Поточну ціну в РРЦ (Так)", headers)
-        self.assertIn("Опт 5 від", headers)
+        self.assertIn("Поточна ціна (% від РРЦ)", headers)
+        self.assertIn("Опт 5 від (шт.)", headers)
         workbook.close()
 
 

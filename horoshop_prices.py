@@ -4,7 +4,7 @@ import io
 import json
 import re
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -83,6 +83,7 @@ class WholesaleChange:
 class PriceRow:
     display_article: str
     current: FieldChange
+    current_percent_of_old: Decimal | None
     old: FieldChange
     move_current_to_old: bool
     move_old_to_current: bool
@@ -242,10 +243,12 @@ def parse_yes(value: Any, label: str) -> bool:
 
 def column_map(headers: tuple[Any, ...]) -> dict[str, int]:
     mapping: dict[str, int] = {}
-    aliases = {"поточна ціна": "price", "ррц": "old", "поточну ціну в ррц (так)": "move", "ррц в поточну ціну (так)": "restore"}
+    aliases = {"поточна ціна": "price", "поточна ціна (грн)": "price", "поточна ціна, % від ррц": "percent", "поточна ціна (% від ррц)": "percent", "ррц": "old", "ррц (грн)": "old", "поточну ціну в ррц (так)": "move", "ррц в поточну ціну (так)": "restore"}
     for tier in range(1, 6):
         aliases[f"опт {tier}"] = f"wholesale_{tier}"
+        aliases[f"опт {tier} (грн)"] = f"wholesale_{tier}"
         aliases[f"опт {tier} від"] = f"threshold_{tier}"
+        aliases[f"опт {tier} від (шт.)"] = f"threshold_{tier}"
     for index, value in enumerate(headers):
         key = header_key(value)
         target = "article" if key in HEADER_ARTICLE else aliases.get(key)
@@ -284,6 +287,12 @@ def parse_excel_prices(data: bytes) -> list[PriceRow]:
                 current = parse_change(cell(row, mapping, "price"), "Поточна ціна")
                 if current.delete:
                     raise ValueError("поточну ціну не можна видалити. Вкажіть нове значення.")
+                percent_text = normalize(cell(row, mapping, "percent"))
+                percent = parse_decimal(percent_text, "Відсоток від РРЦ") if percent_text else None
+                if percent is not None and not Decimal("1") <= percent <= Decimal("100"):
+                    raise ValueError("відсоток від РРЦ має бути від 1 до 100.")
+                if current.value is not None and percent is not None:
+                    raise ValueError("вкажіть або поточну ціну, або відсоток від РРЦ, але не обидва значення.")
                 old = parse_change(cell(row, mapping, "old"), "РРЦ")
                 move = parse_yes(cell(row, mapping, "move"), "Поточну ціну в РРЦ (Так)")
                 restore = parse_yes(cell(row, mapping, "restore"), "РРЦ в поточну ціну (Так)")
@@ -291,10 +300,14 @@ def parse_excel_prices(data: bytes) -> list[PriceRow]:
                     raise ValueError("в одному рядку можна обрати лише один автоматичний перенос ціни.")
                 if move and old.specified:
                     raise ValueError("не поєднуйте РРЦ та «Поточну ціну в РРЦ (Так)» в одному рядку.")
-                if move and current.value is None:
-                    raise ValueError("для перенесення поточної ціни в РРЦ вкажіть нову «Поточну ціну».")
+                if move and current.value is None and percent is None:
+                    raise ValueError("для перенесення поточної ціни в РРЦ вкажіть нову поточну ціну або відсоток від РРЦ.")
                 if restore and old.value is not None:
                     raise ValueError("для перенесення РРЦ у поточну ціну не вказуйте нове значення РРЦ.")
+                if restore and percent is not None:
+                    raise ValueError("не поєднуйте перенесення РРЦ у поточну ціну з відсотком від РРЦ.")
+                if percent is not None and old.delete:
+                    raise ValueError("не можна видаляти РРЦ, з якого обчислюється поточна ціна.")
                 wholesale: list[WholesaleChange] = []
                 for tier in range(1, 6):
                     change = parse_change(cell(row, mapping, f"wholesale_{tier}"), f"Опт {tier}")
@@ -303,9 +316,9 @@ def parse_excel_prices(data: bytes) -> list[PriceRow]:
                         raise ValueError(f"для Опт {tier} задано кількість без ціни або команди «Видалити».")
                     if change.specified:
                         wholesale.append(WholesaleChange(tier, change, threshold))
-                if not current.specified and not old.specified and not move and not restore and not wholesale:
+                if not current.specified and percent is None and not old.specified and not move and not restore and not wholesale:
                     continue
-                rows.append(PriceRow(article, current, old, move, restore, tuple(wholesale), row_number))
+                rows.append(PriceRow(article, current, percent, old, move, restore, tuple(wholesale), row_number))
             except ValueError as error:
                 raise ValueError(f"Рядок {row_number}: {error}") from error
         if not rows:
@@ -326,16 +339,16 @@ def build_excel_template() -> bytes:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Ціни"
-    headers = ["Артикул", "Поточна ціна", "РРЦ", "Поточну ціну в РРЦ (Так)", "РРЦ в поточну ціну (Так)"]
+    headers = ["Артикул", "Поточна ціна (грн)", "Поточна ціна (% від РРЦ)", "РРЦ (грн)", "Поточну ціну в РРЦ (Так)", "РРЦ в поточну ціну (Так)"]
     for tier in range(1, 6):
-        headers.extend([f"Опт {tier}", f"Опт {tier} від"])
+        headers.extend([f"Опт {tier} (грн)", f"Опт {tier} від (шт.)"])
     sheet.append(headers)
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = "A1:O1"
-    for column, width in {"A": 28, "B": 16, "C": 16, "D": 28, "E": 28, "F": 14, "G": 14, "H": 14, "I": 14, "J": 14, "K": 14, "L": 14, "M": 14, "N": 14, "O": 14}.items():
+    sheet.auto_filter.ref = "A1:P1"
+    for column, width in {"A": 28, "B": 16, "C": 24, "D": 16, "E": 28, "F": 28, "G": 14, "H": 14, "I": 14, "J": 14, "K": 14, "L": 14, "M": 14, "N": 14, "O": 14, "P": 14}.items():
         sheet.column_dimensions[column].width = width
     _style_header(sheet)
-    examples = [("01063", 750, "", "Так", "", "", "", "", "", "", "", 650, 20, "", "")]
+    examples = [("01063", "", 75, "", "Так", "", "", "", "", "", "", "", 650, 20, "", "")]
     for row in examples:
         sheet.append(row)
     for row in range(2, 202):
@@ -350,6 +363,7 @@ def build_excel_template() -> bytes:
         "Один рядок = один товар. Кожен стовпець керує окремою ціною цього товару.",
         "Артикул можна вказати як article_for_display зі сайту або внутрішній article Хорошоп. Пошук: точний, потім без урахування регістру.",
         "Порожня клітинка означає «не змінювати». Видалення виконується тільки словом «Видалити» у клітинці РРЦ або потрібного Опт 1-5.",
+        "«Поточна ціна, % від РРЦ»: вкажіть число від 1 до 100, у тому числі дробове. Поточна ціна = РРЦ × відсоток / 100 з округленням до цілої гривні вниз.",
         "«Поточну ціну в РРЦ (Так)»: коли вказано нову поточну ціну, попередня поточна ціна буде записана в РРЦ. Не заповнюйте при цьому стовпець РРЦ.",
         "«РРЦ в поточну ціну (Так)» копіює наявне РРЦ у поточну ціну. Щоб одночасно прибрати РРЦ, напишіть «Видалити» у стовпці РРЦ.",
         "Опт 1-3 розраховується від РРЦ/старої ціни за правилами 2 шт. -10%, 5 шт. -15%, 10 шт. -25%. Правила можна змінити у config.json.",
@@ -446,11 +460,16 @@ def plan_prices(rows: list[PriceRow], catalog: CatalogIndex, settings: Settings)
         product = catalog.by_article[article]
         current = product.price
         old = product.price_old
-        has_current = row.current.value is not None or row.move_old_to_current
+        has_current = row.current.value is not None or row.current_percent_of_old is not None or row.move_old_to_current
         has_old = row.old.specified or row.move_current_to_old
         direct_wholesale = bool(row.wholesale)
         if row.move_old_to_current:
             current = product.price_old
+        elif row.current_percent_of_old is not None:
+            if old is None:
+                plans.append(PricePlan(article, product.display_article or article, {}, (row,), error="Немає РРЦ для обчислення поточної ціни за відсотком."))
+                continue
+            current = (old * row.current_percent_of_old / Decimal("100")).quantize(Decimal("1"), rounding=ROUND_DOWN)
         elif row.current.value is not None:
             current = row.current.value
         if row.move_current_to_old:

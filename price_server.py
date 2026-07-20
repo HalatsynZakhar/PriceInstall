@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +85,8 @@ def serialise(plan: PricePlan, status: str | None = None, message: str = "") -> 
     changes: list[str] = []
     if row.current.value is not None:
         changes.append(f"Поточна ціна: {row.current.value}")
+    if row.current_percent_of_old is not None:
+        changes.append(f"Поточна ціна: {row.current_percent_of_old}% від РРЦ")
     if row.old.value is not None:
         changes.append(f"РРЦ: {row.old.value}")
     elif row.old.delete:
@@ -185,15 +188,25 @@ async def one_price(request: Request) -> dict[str, Any]:
         data = await request.json()
         price_type = parse_price_type(data.get("price_type"))
         raw_value = normalize(data.get("value"))
+        raw_percent = normalize(data.get("percent"))
+        if raw_value and raw_percent:
+            raise ValueError("Вкажіть суму в грн або відсоток від РРЦ, але не обидва значення.")
         delete = raw_value.casefold() in {"видалити", "delete"}
         if delete and price_type == "price":
             raise ValueError("Поточну ціну не можна видалити. Вкажіть нове значення.")
-        value = None if delete else parse_decimal(raw_value)
+        value = None if delete else (parse_decimal(raw_value) if raw_value else None)
+        percent = parse_decimal(raw_percent, "Відсоток від РРЦ") if raw_percent else None
+        if percent is not None and not Decimal("1") <= percent <= Decimal("100"):
+            raise ValueError("Відсоток від РРЦ має бути від 1 до 100.")
+        if value is None and percent is None and not delete:
+            raise ValueError("Вкажіть суму в грн, відсоток від РРЦ або «Видалити».")
+        if percent is not None and price_type != "price":
+            raise ValueError("Відсоток від РРЦ доступний лише для поточної ціни.")
         threshold = parse_threshold(data.get("threshold"))
         current = FieldChange(value=value) if price_type == "price" else FieldChange()
         old = FieldChange(value=value, delete=delete) if price_type == "price_old" else FieldChange()
         wholesale = () if not price_type.startswith("wholesale_") else (WholesaleChange(int(price_type.rsplit("_", 1)[1]), FieldChange(value=value, delete=delete), threshold),)
-        row = PriceRow(normalize(data.get("article")), current, old, False, False, wholesale, 1)
+        row = PriceRow(normalize(data.get("article")), current, percent, old, False, False, wholesale, 1)
         return await asyncio.to_thread(execute_rows, [row], credentials_from(data))
     except (HoroshopPricesError, ValueError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
