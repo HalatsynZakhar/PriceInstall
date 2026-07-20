@@ -30,22 +30,27 @@ class HoroshopPricesTests(unittest.TestCase):
         return CatalogIndex.from_raw([{"article":"REAL-1","article_for_display":"Display-1","price":1000,"price_old":1000,"wholesale_prices":[{"minimal_threshold":2,"price":900},{"minimal_threshold":20,"price":700}]}])
 
     def test_sale_price_disables_wholesale_price_above_it(self):
-        row = PriceRow("Display-1", FieldChange(Decimal("750")), FieldChange(), False, (), 2)
+        row = PriceRow("Display-1", FieldChange(Decimal("750")), FieldChange(), False, False, (), 2)
         plan = plan_prices([row], self.catalog(), self.settings())[0]
         self.assertEqual(plan.payload["wholesale_prices"], [{"minimal_threshold": 20, "price": 700.0}])
         self.assertIn("Вимкнено", "; ".join(plan.warnings))
 
     def test_moves_existing_current_price_to_rrc(self):
-        row = PriceRow("REAL-1", FieldChange(Decimal("800")), FieldChange(), True, (), 2)
+        row = PriceRow("REAL-1", FieldChange(Decimal("800")), FieldChange(), True, False, (), 2)
         plan = plan_prices([row], self.catalog(), self.settings())[0]
         self.assertEqual(plan.payload["price"], 800.0)
         self.assertEqual(plan.payload["price_old"], 1000.0)
 
     def test_explicit_delete_is_different_from_blank(self):
-        row = PriceRow("REAL-1", FieldChange(), FieldChange(delete=True), False, (WholesaleChange(1, FieldChange(delete=True)),), 2)
+        row = PriceRow("REAL-1", FieldChange(), FieldChange(delete=True), False, False, (WholesaleChange(1, FieldChange(delete=True)),), 2)
         plan = plan_prices([row], self.catalog(), self.settings())[0]
         self.assertEqual(plan.payload["price_old"], 0)
         self.assertEqual(plan.payload["wholesale_prices"], [{"minimal_threshold": 20, "price": 700.0}])
+
+    def test_moves_rrc_to_current_price(self):
+        row = PriceRow("REAL-1", FieldChange(), FieldChange(), False, True, (), 2)
+        plan = plan_prices([row], self.catalog(), self.settings())[0]
+        self.assertEqual(plan.payload["price"], 1000.0)
 
     def test_excel_supports_one_row_and_reordered_columns(self):
         rows = parse_excel_prices(self.excel(["Опт 1", "Артикул", "Поточна ціна", "Поточну ціну в РРЦ (Так)", "Опт 1 від"], [(800, "A", 900, "Так", 3)]))

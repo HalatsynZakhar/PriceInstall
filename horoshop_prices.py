@@ -85,6 +85,7 @@ class PriceRow:
     current: FieldChange
     old: FieldChange
     move_current_to_old: bool
+    move_old_to_current: bool
     wholesale: tuple[WholesaleChange, ...]
     row_number: int
 
@@ -241,7 +242,7 @@ def parse_yes(value: Any, label: str) -> bool:
 
 def column_map(headers: tuple[Any, ...]) -> dict[str, int]:
     mapping: dict[str, int] = {}
-    aliases = {"поточна ціна": "price", "ррц": "old", "поточну ціну в ррц (так)": "move"}
+    aliases = {"поточна ціна": "price", "ррц": "old", "поточну ціну в ррц (так)": "move", "ррц в поточну ціну (так)": "restore"}
     for tier in range(1, 6):
         aliases[f"опт {tier}"] = f"wholesale_{tier}"
         aliases[f"опт {tier} від"] = f"threshold_{tier}"
@@ -285,10 +286,15 @@ def parse_excel_prices(data: bytes) -> list[PriceRow]:
                     raise ValueError("поточну ціну не можна видалити. Вкажіть нове значення.")
                 old = parse_change(cell(row, mapping, "old"), "РРЦ")
                 move = parse_yes(cell(row, mapping, "move"), "Поточну ціну в РРЦ (Так)")
+                restore = parse_yes(cell(row, mapping, "restore"), "РРЦ в поточну ціну (Так)")
+                if move and restore:
+                    raise ValueError("в одному рядку можна обрати лише один автоматичний перенос ціни.")
                 if move and old.specified:
                     raise ValueError("не поєднуйте РРЦ та «Поточну ціну в РРЦ (Так)» в одному рядку.")
                 if move and current.value is None:
                     raise ValueError("для перенесення поточної ціни в РРЦ вкажіть нову «Поточну ціну».")
+                if restore and old.value is not None:
+                    raise ValueError("для перенесення РРЦ у поточну ціну не вказуйте нове значення РРЦ.")
                 wholesale: list[WholesaleChange] = []
                 for tier in range(1, 6):
                     change = parse_change(cell(row, mapping, f"wholesale_{tier}"), f"Опт {tier}")
@@ -297,9 +303,9 @@ def parse_excel_prices(data: bytes) -> list[PriceRow]:
                         raise ValueError(f"для Опт {tier} задано кількість без ціни або команди «Видалити».")
                     if change.specified:
                         wholesale.append(WholesaleChange(tier, change, threshold))
-                if not current.specified and not old.specified and not move and not wholesale:
+                if not current.specified and not old.specified and not move and not restore and not wholesale:
                     continue
-                rows.append(PriceRow(article, current, old, move, tuple(wholesale), row_number))
+                rows.append(PriceRow(article, current, old, move, restore, tuple(wholesale), row_number))
             except ValueError as error:
                 raise ValueError(f"Рядок {row_number}: {error}") from error
         if not rows:
@@ -320,16 +326,16 @@ def build_excel_template() -> bytes:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Ціни"
-    headers = ["Артикул", "Поточна ціна", "РРЦ", "Поточну ціну в РРЦ (Так)"]
+    headers = ["Артикул", "Поточна ціна", "РРЦ", "Поточну ціну в РРЦ (Так)", "РРЦ в поточну ціну (Так)"]
     for tier in range(1, 6):
         headers.extend([f"Опт {tier}", f"Опт {tier} від"])
     sheet.append(headers)
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = "A1:N1"
-    for column, width in {"A": 28, "B": 16, "C": 16, "D": 28, "E": 14, "F": 14, "G": 14, "H": 14, "I": 14, "J": 14, "K": 14, "L": 14, "M": 14, "N": 14}.items():
+    sheet.auto_filter.ref = "A1:O1"
+    for column, width in {"A": 28, "B": 16, "C": 16, "D": 28, "E": 28, "F": 14, "G": 14, "H": 14, "I": 14, "J": 14, "K": 14, "L": 14, "M": 14, "N": 14, "O": 14}.items():
         sheet.column_dimensions[column].width = width
     _style_header(sheet)
-    examples = [("01063", 750, "", "Так", "", "", "", "", "", "", 650, 20, "", "")]
+    examples = [("01063", 750, "", "Так", "", "", "", "", "", "", "", 650, 20, "", "")]
     for row in examples:
         sheet.append(row)
     for row in range(2, 202):
@@ -345,6 +351,7 @@ def build_excel_template() -> bytes:
         "Артикул можна вказати як article_for_display зі сайту або внутрішній article Хорошоп. Пошук: точний, потім без урахування регістру.",
         "Порожня клітинка означає «не змінювати». Видалення виконується тільки словом «Видалити» у клітинці РРЦ або потрібного Опт 1-5.",
         "«Поточну ціну в РРЦ (Так)»: коли вказано нову поточну ціну, попередня поточна ціна буде записана в РРЦ. Не заповнюйте при цьому стовпець РРЦ.",
+        "«РРЦ в поточну ціну (Так)» копіює наявне РРЦ у поточну ціну. Щоб одночасно прибрати РРЦ, напишіть «Видалити» у стовпці РРЦ.",
         "Опт 1-3 розраховується від РРЦ/старої ціни за правилами 2 шт. -10%, 5 шт. -15%, 10 шт. -25%. Правила можна змінити у config.json.",
         "Акційна ціна не зменшує опт. Оптові ціни, які не нижчі за поточну ціну, автоматично виключаються. Інші наявні рівні опта зберігаються.",
         "Для будь-якого Опт 1-5 можна вказати «Кількість від». Якщо для Опт 1-3 вона порожня, поріг береться з config.json. Для Опт 4-5 кількість обов'язкова.",
@@ -439,10 +446,12 @@ def plan_prices(rows: list[PriceRow], catalog: CatalogIndex, settings: Settings)
         product = catalog.by_article[article]
         current = product.price
         old = product.price_old
-        has_current = row.current.value is not None
+        has_current = row.current.value is not None or row.move_old_to_current
         has_old = row.old.specified or row.move_current_to_old
         direct_wholesale = bool(row.wholesale)
-        if has_current:
+        if row.move_old_to_current:
+            current = product.price_old
+        elif row.current.value is not None:
             current = row.current.value
         if row.move_current_to_old:
             old = product.price
@@ -450,6 +459,9 @@ def plan_prices(rows: list[PriceRow], catalog: CatalogIndex, settings: Settings)
             old = None
         elif row.old.value is not None:
             old = row.old.value
+        if row.move_old_to_current and product.price_old is None:
+            plans.append(PricePlan(article, product.display_article or article, {}, (row,), error="Немає РРЦ, яке можна перенести в поточну ціну."))
+            continue
         if current is None:
             plans.append(PricePlan(article, product.display_article or article, {}, (row,), error="Немає поточної ціни: спочатку встановіть «Поточна ціна«."))
             continue
