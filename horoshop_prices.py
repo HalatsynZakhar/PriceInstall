@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
+from itertools import chain
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
@@ -226,6 +227,7 @@ def load_settings(config_file: Path) -> Settings:
 DELETE_MARKERS = {"видалити", "delete", "так", "yes"}
 YES_MARKERS = {"так", "да", "yes", "1"}
 HEADER_ARTICLE = {"артикул", "артикул для відображення", "article", "article_for_display"}
+MAPPING_HEADER_MARKERS = ("артикул", "article", "варіант", "вариант", "variant", "подартикул", "підартикул", "субартикул", "source", "target", "ключ")
 @dataclass(frozen=True)
 class ArticleMappings:
     entries: dict[str, tuple[str, ...]]
@@ -374,18 +376,27 @@ def mapping_column_indexes(headers: tuple[Any, ...]) -> tuple[int, ...]:
     return indexes
 
 
+def is_mapping_header(row: tuple[Any, ...]) -> bool:
+    return any(marker in header_key(value) for value in row for marker in MAPPING_HEADER_MARKERS)
+
+
 def parse_article_mappings(data: bytes) -> ArticleMappings:
     workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     try:
         worksheet = workbook.worksheets[0]
         iterator = worksheet.iter_rows(values_only=True)
         try:
-            headers = next(iterator)
+            first_row = next(iterator)
         except StopIteration as error:
             raise ValueError("Файл сопоставлень порожній.") from error
-        column_indexes = mapping_column_indexes(headers)
+        if is_mapping_header(first_row):
+            column_indexes = mapping_column_indexes(first_row)
+            rows = iterator
+        else:
+            column_indexes = tuple(range(len(first_row)))
+            rows = chain((first_row,), iterator)
         mappings: dict[str, list[str]] = {}
-        for row in iterator:
+        for row in rows:
             if not row or all(value is None for value in row):
                 continue
             articles = list(dict.fromkeys(

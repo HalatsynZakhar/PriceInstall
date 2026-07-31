@@ -117,10 +117,7 @@ class HoroshopPricesTests(unittest.TestCase):
         self.assertEqual(plans[0].payload["price"], 900.0)
 
     def test_mapping_uses_all_rows_with_the_same_key(self):
-        mappings = parse_article_mappings(self.excel(
-            ["Варіант 1", "Варіант 2"],
-            [("12520", "12520-12513"), ("12520", "12520-12516")],
-        ))
+        mappings = parse_article_mappings(self.excel([12520, "12520-12513"], [(12520, "12520-12516")]))
         catalog = CatalogIndex.from_raw([
             {"article": "12520", "article_for_display": "Base", "price": 1000, "price_old": 1000, "wholesale_prices": []},
             {"article": "12520-12513", "article_for_display": "First", "price": 1000, "price_old": 1000, "wholesale_prices": []},
