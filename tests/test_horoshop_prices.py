@@ -8,7 +8,7 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-from horoshop_prices import CatalogIndex, FieldChange, PriceRow, WholesaleChange, build_excel_template, load_settings, parse_excel_prices, plan_prices
+from horoshop_prices import ArticleMappings, CatalogIndex, FieldChange, PricePlan, PriceRow, WholesaleChange, build_excel_template, build_failed_excel, load_article_mappings, load_settings, normalize_article_code, parse_article_mappings, parse_excel_prices, plan_prices, save_article_mappings
 
 
 class HoroshopPricesTests(unittest.TestCase):
@@ -28,6 +28,12 @@ class HoroshopPricesTests(unittest.TestCase):
 
     def catalog(self):
         return CatalogIndex.from_raw([{"article":"REAL-1","article_for_display":"Display-1","price":1000,"price_old":1000,"wholesale_prices":[{"minimal_threshold":2,"price":900},{"minimal_threshold":20,"price":700}]}])
+
+    def multi_catalog(self):
+        return CatalogIndex.from_raw([
+            {"article":"REAL-1","article_for_display":"Display-1","price":1000,"price_old":1000,"wholesale_prices":[]},
+            {"article":"REAL-2","article_for_display":"Display-2","price":1100,"price_old":1100,"wholesale_prices":[]},
+        ])
 
     def test_sale_price_disables_wholesale_price_above_it(self):
         row = PriceRow("Display-1", FieldChange(Decimal("750")), None, FieldChange(), False, False, (), 2)
@@ -81,6 +87,44 @@ class HoroshopPricesTests(unittest.TestCase):
         self.assertIn("Поточну ціну в РРЦ (Так)", headers)
         self.assertIn("Поточна ціна (% від РРЦ)", headers)
         self.assertIn("Опт 5 від (шт.)", headers)
+        workbook.close()
+
+    def test_normalized_article_lookup_is_optional(self):
+        row = PriceRow("Display.1", FieldChange(Decimal("900")), None, FieldChange(), False, False, (), 2)
+        without_normalization = plan_prices([row], self.catalog(), self.settings())[0]
+        with_normalization = plan_prices([row], self.catalog(), self.settings(), normalize_articles=True)[0]
+        self.assertFalse(without_normalization.ready)
+        self.assertEqual(with_normalization.article, "REAL-1")
+        self.assertEqual(normalize_article_code("A  (B)__C...D"), "A-B-C-D")
+
+    def test_mapping_file_can_expand_one_source_article_to_multiple_targets(self):
+        mappings = parse_article_mappings(self.excel(["Артикул", "Подартикул"], [("SET-1", "REAL-1"), ("SET-1", "REAL-2")]))
+        row = PriceRow("SET-1", FieldChange(Decimal("900")), None, FieldChange(), False, False, (), 2)
+        plans = plan_prices([row], self.multi_catalog(), self.settings(), mappings=mappings)
+        self.assertEqual([plan.article for plan in plans], ["REAL-1", "REAL-2"])
+        self.assertEqual([plan.payload["price"] for plan in plans], [900.0, 900.0])
+
+    def test_mapping_database_merges_and_persists_rules(self):
+        initial = ArticleMappings({"SET-1": ("REAL-1",)})
+        additional = ArticleMappings({"SET-1": ("REAL-2",), "SET-2": ("REAL-3",)})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data" / "article_mappings.json"
+            save_article_mappings(path, initial.merged_with(additional))
+            restored = load_article_mappings(path)
+        self.assertEqual(restored.entries, {"SET-1": ("REAL-1", "REAL-2"), "SET-2": ("REAL-3",)})
+
+    def test_failed_excel_contains_user_price_fields(self):
+        row = PriceRow("UNKNOWN", FieldChange(Decimal("900")), None, FieldChange(delete=True), False, False, (WholesaleChange(1, FieldChange(Decimal("800")), 3),), 7)
+        data = build_failed_excel([(PricePlan("", "UNKNOWN", {}, (row,), error="not found"), "Помилка", "not found")])
+        workbook = load_workbook(io.BytesIO(data), read_only=True)
+        values = next(workbook["Не встановлено"].iter_rows(min_row=2, max_row=2, values_only=True))
+        self.assertEqual(values[1], "not found")
+        self.assertEqual(values[4], 7)
+        self.assertEqual(values[5], "UNKNOWN")
+        self.assertEqual(values[6], 900)
+        self.assertEqual(values[8], "Видалити")
+        self.assertEqual(values[11], 800)
+        self.assertEqual(values[12], 3)
         workbook.close()
 
 

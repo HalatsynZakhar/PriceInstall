@@ -118,6 +118,15 @@ def normalize(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
+def normalize_article_code(value: Any) -> str:
+    text = normalize(value)
+    if not text:
+        return ""
+    text = "".join(character if character.isalnum() else "-" for character in text)
+    text = re.sub(r"-{2,}", "-", text)
+    return text.strip("-")
+
+
 def endpoint_url(domain: str, endpoint: str) -> str:
     return urljoin(f"{domain.rstrip('/')}/", endpoint.lstrip("/"))
 
@@ -217,6 +226,45 @@ def load_settings(config_file: Path) -> Settings:
 DELETE_MARKERS = {"видалити", "delete", "так", "yes"}
 YES_MARKERS = {"так", "да", "yes", "1"}
 HEADER_ARTICLE = {"артикул", "артикул для відображення", "article", "article_for_display"}
+MAPPING_SOURCE_HEADERS = {
+    "артикул", "артикул у файлі", "артикул в файле", "исходный артикул", "вхідний артикул", "входной артикул", "source", "from",
+}
+MAPPING_TARGET_HEADERS = {
+    "артикул хорошоп", "внутрішній артикул", "внутренний артикул", "подартикул", "підартикул", "субартикул", "дочірній артикул",
+    "дочерний артикул", "article", "article_for_display", "target", "to",
+}
+
+
+@dataclass(frozen=True)
+class ArticleMappings:
+    entries: dict[str, tuple[str, ...]]
+
+    @classmethod
+    def empty(cls) -> "ArticleMappings":
+        return cls({})
+
+    def merged_with(self, other: "ArticleMappings") -> "ArticleMappings":
+        combined = {source: list(targets) for source, targets in self.entries.items()}
+        for source, targets in other.entries.items():
+            combined.setdefault(source, []).extend(targets)
+        return ArticleMappings({source: tuple(dict.fromkeys(targets)) for source, targets in combined.items()})
+
+    def targets_for(self, article: str, use_normalized: bool) -> tuple[str, ...]:
+        if not self.entries:
+            return (article,)
+        exact = self.entries.get(article)
+        if exact:
+            return exact
+        folded = article.casefold()
+        folded_matches = [targets for source, targets in self.entries.items() if source.casefold() == folded]
+        if len(folded_matches) == 1:
+            return folded_matches[0]
+        if use_normalized:
+            normalized = normalize_article_code(article).casefold()
+            normalized_matches = [targets for source, targets in self.entries.items() if normalize_article_code(source).casefold() == normalized]
+            if len(normalized_matches) == 1:
+                return normalized_matches[0]
+        return (article,)
 
 
 def header_key(value: Any) -> str:
@@ -328,6 +376,138 @@ def parse_excel_prices(data: bytes) -> list[PriceRow]:
         workbook.close()
 
 
+def mapping_column_map(headers: tuple[Any, ...]) -> tuple[int, int]:
+    source_index: int | None = None
+    target_index: int | None = None
+    filled_indexes: list[int] = []
+    for index, value in enumerate(headers):
+        key = header_key(value)
+        if not key:
+            continue
+        filled_indexes.append(index)
+        if key in MAPPING_SOURCE_HEADERS and source_index is None:
+            source_index = index
+        if key in MAPPING_TARGET_HEADERS and target_index is None:
+            target_index = index
+    if source_index is None or target_index is None:
+        if len(filled_indexes) >= 2:
+            source_index, target_index = filled_indexes[0], filled_indexes[1]
+        else:
+            raise ValueError("У файлі сопоставлень має бути мінімум два стовпці: артикул з файлу та артикул Хорошоп.")
+    if source_index == target_index:
+        raise ValueError("Стовпці артикула з файлу та артикула Хорошоп мають бути різними.")
+    return source_index, target_index
+
+
+def parse_article_mappings(data: bytes) -> ArticleMappings:
+    workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    try:
+        worksheet = workbook.worksheets[0]
+        iterator = worksheet.iter_rows(values_only=True)
+        try:
+            headers = next(iterator)
+        except StopIteration as error:
+            raise ValueError("Файл сопоставлень порожній.") from error
+        source_index, target_index = mapping_column_map(headers)
+        mappings: dict[str, list[str]] = {}
+        for row_number, row in enumerate(iterator, start=2):
+            if not row or all(value is None for value in row):
+                continue
+            source = normalize(row[source_index] if source_index < len(row) else None)
+            target = normalize(row[target_index] if target_index < len(row) else None)
+            if not source and not target:
+                continue
+            if not source or not target:
+                raise ValueError(f"Рядок {row_number} у файлі сопоставлень: вкажіть обидва артикули.")
+            mappings.setdefault(source, []).append(target)
+        if not mappings:
+            raise ValueError("У файлі сопоставлень немає жодного правила.")
+        return ArticleMappings({source: tuple(dict.fromkeys(targets)) for source, targets in mappings.items()})
+    finally:
+        workbook.close()
+
+
+def load_article_mappings(path: Path) -> ArticleMappings:
+    if not path.exists():
+        return ArticleMappings.empty()
+    try:
+        raw_entries = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise HoroshopPricesError(f"Не вдалося прочитати базу сопоставлень: {path}.") from error
+    if not isinstance(raw_entries, dict):
+        raise HoroshopPricesError("База сопоставлень має некоректний формат.")
+    entries: dict[str, tuple[str, ...]] = {}
+    for source, targets in raw_entries.items():
+        source_article = normalize(source)
+        if not source_article or not isinstance(targets, list):
+            raise HoroshopPricesError("База сопоставлень має некоректний формат.")
+        target_articles = tuple(dict.fromkeys(normalize(target) for target in targets if normalize(target)))
+        if not target_articles:
+            raise HoroshopPricesError("База сопоставлень має некоректний формат.")
+        entries[source_article] = target_articles
+    return ArticleMappings(entries)
+
+
+def save_article_mappings(path: Path, mappings: ArticleMappings) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = {source: list(targets) for source, targets in mappings.entries.items()}
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temporary_path.write_text(json.dumps(serialized, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary_path.replace(path)
+    except OSError as error:
+        raise HoroshopPricesError(f"Не вдалося зберегти базу сопоставлень: {path}.") from error
+
+
+def price_row_excel_values(row: PriceRow) -> list[Any]:
+    values: list[Any] = [
+        row.row_number,
+        row.display_article,
+        float(row.current.value) if row.current.value is not None else "",
+        float(row.current_percent_of_old) if row.current_percent_of_old is not None else "",
+        "Видалити" if row.old.delete else (float(row.old.value) if row.old.value is not None else ""),
+        "Так" if row.move_current_to_old else "",
+        "Так" if row.move_old_to_current else "",
+    ]
+    by_tier = {item.tier: item for item in row.wholesale}
+    for tier in range(1, 6):
+        item = by_tier.get(tier)
+        if item is None:
+            values.extend(["", ""])
+        else:
+            values.extend(["Видалити" if item.change.delete else float(item.change.value or 0), item.threshold or ""])
+    return values
+
+
+def build_failed_excel(failures: list[tuple[PricePlan, str, str]]) -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Не встановлено"
+    headers = ["Статус", "Помилка", "Внутрішній артикул Хорошоп", "Артикул для відображення", "Рядок", "Артикул користувача", "Поточна ціна (грн)", "Поточна ціна (% від РРЦ)", "РРЦ (грн)", "Поточну ціну в РРЦ (Так)", "РРЦ в поточну ціну (Так)"]
+    for tier in range(1, 6):
+        headers.extend([f"Опт {tier} (грн)", f"Опт {tier} від (шт.)"])
+    sheet.append(headers)
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = f"A1:{sheet.cell(row=1, column=len(headers)).coordinate}"
+    for plan, status, message in failures:
+        row = plan.rows[0]
+        sheet.append([status, message, plan.article, plan.display_article] + price_row_excel_values(row))
+    widths = {
+        "A": 14, "B": 56, "C": 26, "D": 26, "E": 10, "F": 28, "G": 18, "H": 24, "I": 14, "J": 26, "K": 26,
+    }
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
+    for index in range(12, len(headers) + 1):
+        sheet.column_dimensions[sheet.cell(row=1, column=index).column_letter].width = 14
+    _style_header(sheet)
+    for row in sheet.iter_rows(min_row=2):
+        row[1].alignment = Alignment(wrap_text=True, vertical="top")
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
+
+
 def _style_header(worksheet: Any) -> None:
     for cell in worksheet[1]:
         cell.font = Font(bold=True, color="FFFFFF")
@@ -385,10 +565,14 @@ class CatalogIndex:
         self.by_article = {item.article: item for item in products}
         self.by_exact: dict[str, list[CatalogProduct]] = {}
         self.by_folded: dict[str, list[CatalogProduct]] = {}
+        self.by_normalized: dict[str, list[CatalogProduct]] = {}
         for item in products:
             for key in {item.article, item.display_article} - {""}:
                 self.by_exact.setdefault(key, []).append(item)
                 self.by_folded.setdefault(key.casefold(), []).append(item)
+                normalized = normalize_article_code(key)
+                if normalized:
+                    self.by_normalized.setdefault(normalized.casefold(), []).append(item)
 
     @classmethod
     def from_raw(cls, raw_products: list[dict[str, Any]]) -> "CatalogIndex":
@@ -404,7 +588,7 @@ class CatalogIndex:
             ))
         return cls(products)
 
-    def resolve(self, value: str) -> tuple[CatalogProduct | None, str]:
+    def resolve(self, value: str, use_normalized: bool = False) -> tuple[CatalogProduct | None, str]:
         exact = list({item.article: item for item in self.by_exact.get(value, [])}.values())
         if len(exact) == 1:
             return exact[0], ""
@@ -415,6 +599,13 @@ class CatalogIndex:
             return folded[0], ""
         if len(folded) > 1:
             return None, f"Артикул '{value}' не є унікальним."
+        if use_normalized:
+            normalized = normalize_article_code(value)
+            normalized_matches = list({item.article: item for item in self.by_normalized.get(normalized.casefold(), [])}.values())
+            if len(normalized_matches) == 1:
+                return normalized_matches[0], ""
+            if len(normalized_matches) > 1:
+                return None, f"Нормалізований артикул '{normalized}' для '{value}' не є унікальним."
         return None, f"Артикул '{value}' не знайдений у каталозі."
 
 
@@ -444,20 +635,30 @@ def wholesale_entries(existing: tuple[dict[str, Any], ...]) -> dict[int, Decimal
     return entries
 
 
-def plan_prices(rows: list[PriceRow], catalog: CatalogIndex, settings: Settings) -> list[PricePlan]:
+def plan_prices(
+    rows: list[PriceRow],
+    catalog: CatalogIndex,
+    settings: Settings,
+    normalize_articles: bool = False,
+    mappings: ArticleMappings | None = None,
+) -> list[PricePlan]:
     grouped: dict[str, PriceRow] = {}
+    grouped_products: dict[str, CatalogProduct] = {}
     errors: list[PricePlan] = []
+    mappings = mappings or ArticleMappings.empty()
     for row in rows:
-        product, error = catalog.resolve(row.display_article)
-        if error or product is None:
-            errors.append(PricePlan("", row.display_article, {}, (row,), error=error))
-        elif product.article in grouped:
-            errors.append(PricePlan(product.article, product.display_article or product.article, {}, (row,), error="Артикул повторюється у файлі. Для товару має бути лише один рядок."))
-        else:
-            grouped[product.article] = row
+        for target_article in mappings.targets_for(row.display_article, normalize_articles):
+            product, error = catalog.resolve(target_article, normalize_articles)
+            if error or product is None:
+                errors.append(PricePlan("", target_article, {}, (row,), error=error))
+            elif product.article in grouped:
+                errors.append(PricePlan(product.article, product.display_article or product.article, {}, (row,), error="Артикул повторюється у файлі або базі сопоставлень. Для товару має бути лише одна команда."))
+            else:
+                grouped[product.article] = row
+                grouped_products[product.article] = product
     plans = errors
     for article, row in grouped.items():
-        product = catalog.by_article[article]
+        product = grouped_products[article]
         current = product.price
         old = product.price_old
         has_current = row.current.value is not None or row.current_percent_of_old is not None or row.move_old_to_current

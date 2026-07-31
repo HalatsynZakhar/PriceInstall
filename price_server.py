@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import sys
+import threading
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -11,16 +13,19 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from horoshop_prices import (
-    CatalogIndex, Credentials, FieldChange, HoroshopClient, HoroshopPricesError, PricePlan, PriceRow, Settings, WholesaleChange,
-    build_excel_template, import_results, load_settings, normalize, parse_decimal, parse_excel_prices, parse_price_type, parse_threshold, plan_prices,
+    ArticleMappings, CatalogIndex, Credentials, FieldChange, HoroshopClient, HoroshopPricesError, PricePlan, PriceRow, Settings, WholesaleChange,
+    build_excel_template, build_failed_excel, import_results, load_article_mappings, load_settings, normalize, parse_article_mappings,
+    parse_decimal, parse_excel_prices, parse_price_type, parse_threshold, plan_prices, save_article_mappings,
 )
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = PROJECT_DIR / "config.json"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAPPINGS_FILE = PROJECT_DIR / "data" / "article_mappings.json"
 settings: Settings | None = None
 logger = logging.getLogger(__name__)
+mapping_lock = threading.Lock()
 
 
 class PublicLogStream:
@@ -108,31 +113,77 @@ def serialise(plan: PricePlan, status: str | None = None, message: str = "") -> 
     }
 
 
-def preview_rows(rows: list[PriceRow], credentials: Credentials) -> dict[str, Any]:
+def with_failed_excel(result: dict[str, Any], failures: list[tuple[PricePlan, str, str]]) -> dict[str, Any]:
+    if failures:
+        result["failed_excel"] = base64.b64encode(build_failed_excel(failures)).decode("ascii")
+        result["failed_excel_name"] = "horoshop_prices_failed.xlsx"
+    return result
+
+
+def preview_rows(rows: list[PriceRow], credentials: Credentials, normalize_articles: bool, mappings: ArticleMappings) -> dict[str, Any]:
     catalog, _ = catalog_for(credentials)
-    plans = plan_prices(rows, catalog, get_settings())
-    return {"items": [serialise(plan) for plan in plans], "ready": sum(plan.ready for plan in plans), "errors": sum(not plan.ready for plan in plans)}
+    plans = plan_prices(rows, catalog, get_settings(), normalize_articles, mappings)
+    items = [serialise(plan) for plan in plans]
+    failures = [(plan, "Помилка", item["message"]) for plan, item in zip(plans, items) if not plan.ready]
+    return with_failed_excel({"items": items, "ready": sum(plan.ready for plan in plans), "errors": len(failures)}, failures)
 
 
-def execute_rows(rows: list[PriceRow], credentials: Credentials) -> dict[str, Any]:
+def execute_rows(rows: list[PriceRow], credentials: Credentials, normalize_articles: bool = True, mappings: ArticleMappings | None = None) -> dict[str, Any]:
     catalog, client = catalog_for(credentials)
-    plans = plan_prices(rows, catalog, get_settings())
+    plans = plan_prices(rows, catalog, get_settings(), normalize_articles, mappings or ArticleMappings.empty())
     payload = [plan.payload for plan in plans if plan.ready]
     api_results: dict[str, tuple[bool, str]] = {}
     for start in range(0, len(payload), get_settings().batch_size):
         api_results.update(import_results(client.import_products(payload[start:start + get_settings().batch_size])))
     items: list[dict[str, Any]] = []
+    failures: list[tuple[PricePlan, str, str]] = []
     for plan in plans:
         if not plan.ready:
-            items.append(serialise(plan, "invalid"))
+            item = serialise(plan, "invalid")
+            items.append(item)
+            failures.append((plan, "Помилка перевірки", item["message"]))
             continue
         success, message = api_results.get(plan.article, (False, "API не повернуло результат для товару."))
         joined = "; ".join(item for item in ("; ".join(plan.warnings), message) if item)
-        items.append(serialise(plan, "synced" if success else "error", joined))
-    return {"items": items, "imported": sum(item["status"] == "synced" for item in items), "errors": sum(item["status"] in {"error", "invalid"} for item in items)}
+        item = serialise(plan, "synced" if success else "error", joined)
+        items.append(item)
+        if not success:
+            failures.append((plan, "Помилка API", item["message"]))
+    return with_failed_excel({"items": items, "imported": sum(item["status"] == "synced" for item in items), "errors": sum(item["status"] in {"error", "invalid"} for item in items)}, failures)
 
 
-async def uploaded_rows(request: Request) -> tuple[list[PriceRow], Credentials]:
+def parse_bool(value: Any, default: bool = False) -> bool:
+    text = normalize(value).casefold()
+    if not text:
+        return default
+    return text not in {"0", "false", "ні", "нет", "no", "off"}
+
+
+def stored_mappings() -> ArticleMappings:
+    with mapping_lock:
+        return load_article_mappings(MAPPINGS_FILE)
+
+
+def add_to_stored_mappings(uploaded_mappings: ArticleMappings) -> ArticleMappings:
+    with mapping_lock:
+        combined = load_article_mappings(MAPPINGS_FILE).merged_with(uploaded_mappings)
+        save_article_mappings(MAPPINGS_FILE, combined)
+        return combined
+
+
+async def uploaded_mappings(form: Any) -> ArticleMappings | None:
+    mapping_file = form.get("mapping_file")
+    if mapping_file is None or not hasattr(mapping_file, "read") or not normalize(getattr(mapping_file, "filename", "")):
+        return None
+    if not str(getattr(mapping_file, "filename", "")).lower().endswith((".xlsx", ".xlsm")):
+        raise HoroshopPricesError("Файл сопоставлень має бути .xlsx або .xlsm.")
+    mapping_contents = await mapping_file.read()
+    if not mapping_contents or len(mapping_contents) > MAX_UPLOAD_BYTES:
+        raise HoroshopPricesError("Файл сопоставлень порожній або перевищує 20 МБ.")
+    return await asyncio.to_thread(parse_article_mappings, mapping_contents)
+
+
+async def uploaded_rows(request: Request) -> tuple[list[PriceRow], Credentials, bool, ArticleMappings]:
     form = await request.form()
     uploaded = form.get("file")
     if uploaded is None or not hasattr(uploaded, "read"):
@@ -142,7 +193,11 @@ async def uploaded_rows(request: Request) -> tuple[list[PriceRow], Credentials]:
     contents = await uploaded.read()
     if not contents or len(contents) > MAX_UPLOAD_BYTES:
         raise HoroshopPricesError("Excel-файл порожній або перевищує 20 МБ.")
-    return parse_excel_prices(contents), credentials_from(dict(form))
+    mappings = stored_mappings()
+    additional_mappings = await uploaded_mappings(form)
+    if additional_mappings is not None:
+        mappings = await asyncio.to_thread(add_to_stored_mappings, additional_mappings)
+    return parse_excel_prices(contents), credentials_from(dict(form)), parse_bool(form.get("normalize_articles"), True), mappings
 
 
 app = FastAPI(title="Ціни Хорошоп")
@@ -164,11 +219,23 @@ def template() -> Response:
     return Response(build_excel_template(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": 'attachment; filename="horoshop_prices_template.xlsx"', "Cache-Control": "no-store"})
 
 
+@app.post("/api/mappings")
+async def upload_mappings(request: Request) -> dict[str, int]:
+    try:
+        mappings = await uploaded_mappings(await request.form())
+        if mappings is None:
+            raise HoroshopPricesError("Оберіть Excel-файл сопоставлень.")
+        stored = await asyncio.to_thread(add_to_stored_mappings, mappings)
+        return {"sources": len(stored.entries), "rules": sum(len(targets) for targets in stored.entries.values())}
+    except (HoroshopPricesError, ValueError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
 @app.post("/api/preview")
 async def preview(request: Request) -> dict[str, Any]:
     try:
-        rows, credentials = await uploaded_rows(request)
-        return await asyncio.to_thread(preview_rows, rows, credentials)
+        rows, credentials, normalize_articles, mappings = await uploaded_rows(request)
+        return await asyncio.to_thread(preview_rows, rows, credentials, normalize_articles, mappings)
     except (HoroshopPricesError, ValueError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -176,8 +243,8 @@ async def preview(request: Request) -> dict[str, Any]:
 @app.post("/api/import")
 async def import_prices(request: Request) -> dict[str, Any]:
     try:
-        rows, credentials = await uploaded_rows(request)
-        return await asyncio.to_thread(execute_rows, rows, credentials)
+        rows, credentials, normalize_articles, mappings = await uploaded_rows(request)
+        return await asyncio.to_thread(execute_rows, rows, credentials, normalize_articles, mappings)
     except (HoroshopPricesError, ValueError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -207,7 +274,7 @@ async def one_price(request: Request) -> dict[str, Any]:
         old = FieldChange(value=value, delete=delete) if price_type == "price_old" else FieldChange()
         wholesale = () if not price_type.startswith("wholesale_") else (WholesaleChange(int(price_type.rsplit("_", 1)[1]), FieldChange(value=value, delete=delete), threshold),)
         row = PriceRow(normalize(data.get("article")), current, percent, old, False, False, wholesale, 1)
-        return await asyncio.to_thread(execute_rows, [row], credentials_from(data))
+        return await asyncio.to_thread(execute_rows, [row], credentials_from(data), parse_bool(data.get("normalize_articles"), True), stored_mappings())
     except (HoroshopPricesError, ValueError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
