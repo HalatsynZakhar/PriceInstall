@@ -385,7 +385,7 @@ def parse_article_mappings(data: bytes) -> ArticleMappings:
             raise ValueError("Файл сопоставлень порожній.") from error
         column_indexes = mapping_column_indexes(headers)
         mappings: dict[str, list[str]] = {}
-        for row_number, row in enumerate(iterator, start=2):
+        for row in iterator:
             if not row or all(value is None for value in row):
                 continue
             articles = list(dict.fromkeys(
@@ -396,7 +396,7 @@ def parse_article_mappings(data: bytes) -> ArticleMappings:
             if not articles:
                 continue
             if len(articles) < 2:
-                raise ValueError(f"Рядок {row_number} у файлі сопоставлень: вкажіть щонайменше два варіанти артикула.")
+                continue
             for source in articles:
                 mappings.setdefault(source, []).extend(articles)
         if not mappings:

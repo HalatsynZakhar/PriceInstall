@@ -116,6 +116,13 @@ class HoroshopPricesTests(unittest.TestCase):
         self.assertEqual([plan.article for plan in plans], ["TECH/1 (A)"])
         self.assertEqual(plans[0].payload["price"], 900.0)
 
+    def test_mapping_file_skips_blank_and_single_article_rows(self):
+        mappings = parse_article_mappings(self.excel(
+            ["Варіант 1", "Варіант 2", "Варіант 3"],
+            [("", "", ""), ("SINGLE", "", ""), ("SET-1", "REAL-1", "")],
+        ))
+        self.assertEqual(mappings.targets_for("SET-1", False), ("SET-1", "REAL-1"))
+
     def test_mapping_database_merges_and_persists_rules(self):
         initial = ArticleMappings({"SET-1": ("REAL-1",)})
         additional = ArticleMappings({"SET-1": ("REAL-2",), "SET-2": ("REAL-3",)})
