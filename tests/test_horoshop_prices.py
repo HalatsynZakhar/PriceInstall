@@ -112,16 +112,30 @@ class HoroshopPricesTests(unittest.TestCase):
         ))
         row = PriceRow("SELLER-1", FieldChange(Decimal("900")), None, FieldChange(), False, False, (), 2)
         plans = plan_prices([row], catalog, self.settings(), mappings=mappings)
-        self.assertEqual(mappings.targets_for("Visible-1", False), ("SELLER-1", "Visible-1", "TECH/1 (A)"))
+        self.assertEqual(mappings.targets_for("SELLER-1", False), ("Visible-1", "TECH/1 (A)"))
         self.assertEqual([plan.article for plan in plans], ["TECH/1 (A)"])
         self.assertEqual(plans[0].payload["price"], 900.0)
+
+    def test_mapping_uses_all_rows_with_the_same_key(self):
+        mappings = parse_article_mappings(self.excel(
+            ["Варіант 1", "Варіант 2"],
+            [("12520", "12520-12513"), ("12520", "12520-12516")],
+        ))
+        catalog = CatalogIndex.from_raw([
+            {"article": "12520-12513", "article_for_display": "First", "price": 1000, "price_old": 1000, "wholesale_prices": []},
+            {"article": "12520-12516", "article_for_display": "Second", "price": 1000, "price_old": 1000, "wholesale_prices": []},
+        ])
+        row = PriceRow("12520", FieldChange(Decimal("900")), None, FieldChange(), False, False, (), 2)
+        plans = plan_prices([row], catalog, self.settings(), mappings=mappings)
+        self.assertEqual(mappings.targets_for("12520", False), ("12520-12513", "12520-12516"))
+        self.assertEqual([plan.article for plan in plans], ["12520-12513", "12520-12516"])
 
     def test_mapping_file_skips_blank_and_single_article_rows(self):
         mappings = parse_article_mappings(self.excel(
             ["Варіант 1", "Варіант 2", "Варіант 3"],
             [("", "", ""), ("SINGLE", "", ""), ("SET-1", "REAL-1", "")],
         ))
-        self.assertEqual(mappings.targets_for("SET-1", False), ("SET-1", "REAL-1"))
+        self.assertEqual(mappings.targets_for("SET-1", False), ("REAL-1",))
 
     def test_mapping_database_merges_and_persists_rules(self):
         initial = ArticleMappings({"SET-1": ("REAL-1",)})

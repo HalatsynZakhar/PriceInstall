@@ -241,20 +241,24 @@ class ArticleMappings:
         return ArticleMappings({source: tuple(dict.fromkeys(targets)) for source, targets in combined.items()})
 
     def targets_for(self, article: str, use_normalized: bool) -> tuple[str, ...]:
+        def other_variants(targets: tuple[str, ...]) -> tuple[str, ...]:
+            variants = tuple(target for target in targets if normalize(target).casefold() != article.casefold())
+            return variants or (article,)
+
         if not self.entries:
             return (article,)
         exact = self.entries.get(article)
         if exact:
-            return exact
+            return other_variants(exact)
         folded = article.casefold()
         folded_matches = [targets for source, targets in self.entries.items() if source.casefold() == folded]
         if len(folded_matches) == 1:
-            return folded_matches[0]
+            return other_variants(folded_matches[0])
         if use_normalized:
             normalized = normalize_article_code(article).casefold()
             normalized_matches = [targets for source, targets in self.entries.items() if normalize_article_code(source).casefold() == normalized]
             if len(normalized_matches) == 1:
-                return normalized_matches[0]
+                return other_variants(normalized_matches[0])
         return (article,)
 
 
