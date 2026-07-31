@@ -226,15 +226,6 @@ def load_settings(config_file: Path) -> Settings:
 DELETE_MARKERS = {"видалити", "delete", "так", "yes"}
 YES_MARKERS = {"так", "да", "yes", "1"}
 HEADER_ARTICLE = {"артикул", "артикул для відображення", "article", "article_for_display"}
-MAPPING_SOURCE_HEADERS = {
-    "артикул", "артикул у файлі", "артикул в файле", "исходный артикул", "вхідний артикул", "входной артикул", "source", "from",
-}
-MAPPING_TARGET_HEADERS = {
-    "артикул хорошоп", "внутрішній артикул", "внутренний артикул", "подартикул", "підартикул", "субартикул", "дочірній артикул",
-    "дочерний артикул", "article", "article_for_display", "target", "to",
-}
-
-
 @dataclass(frozen=True)
 class ArticleMappings:
     entries: dict[str, tuple[str, ...]]
@@ -376,27 +367,11 @@ def parse_excel_prices(data: bytes) -> list[PriceRow]:
         workbook.close()
 
 
-def mapping_column_map(headers: tuple[Any, ...]) -> tuple[int, int]:
-    source_index: int | None = None
-    target_index: int | None = None
-    filled_indexes: list[int] = []
-    for index, value in enumerate(headers):
-        key = header_key(value)
-        if not key:
-            continue
-        filled_indexes.append(index)
-        if key in MAPPING_SOURCE_HEADERS and source_index is None:
-            source_index = index
-        if key in MAPPING_TARGET_HEADERS and target_index is None:
-            target_index = index
-    if source_index is None or target_index is None:
-        if len(filled_indexes) >= 2:
-            source_index, target_index = filled_indexes[0], filled_indexes[1]
-        else:
-            raise ValueError("У файлі сопоставлень має бути мінімум два стовпці: артикул з файлу та артикул Хорошоп.")
-    if source_index == target_index:
-        raise ValueError("Стовпці артикула з файлу та артикула Хорошоп мають бути різними.")
-    return source_index, target_index
+def mapping_column_indexes(headers: tuple[Any, ...]) -> tuple[int, ...]:
+    indexes = tuple(index for index, value in enumerate(headers) if normalize(value))
+    if len(indexes) < 2:
+        raise ValueError("У файлі сопоставлень має бути мінімум два стовпці з варіантами артикула.")
+    return indexes
 
 
 def parse_article_mappings(data: bytes) -> ArticleMappings:
@@ -408,18 +383,22 @@ def parse_article_mappings(data: bytes) -> ArticleMappings:
             headers = next(iterator)
         except StopIteration as error:
             raise ValueError("Файл сопоставлень порожній.") from error
-        source_index, target_index = mapping_column_map(headers)
+        column_indexes = mapping_column_indexes(headers)
         mappings: dict[str, list[str]] = {}
         for row_number, row in enumerate(iterator, start=2):
             if not row or all(value is None for value in row):
                 continue
-            source = normalize(row[source_index] if source_index < len(row) else None)
-            target = normalize(row[target_index] if target_index < len(row) else None)
-            if not source and not target:
+            articles = list(dict.fromkeys(
+                normalize(row[index] if index < len(row) else None)
+                for index in column_indexes
+                if normalize(row[index] if index < len(row) else None)
+            ))
+            if not articles:
                 continue
-            if not source or not target:
-                raise ValueError(f"Рядок {row_number} у файлі сопоставлень: вкажіть обидва артикули.")
-            mappings.setdefault(source, []).append(target)
+            if len(articles) < 2:
+                raise ValueError(f"Рядок {row_number} у файлі сопоставлень: вкажіть щонайменше два варіанти артикула.")
+            for source in articles:
+                mappings.setdefault(source, []).extend(articles)
         if not mappings:
             raise ValueError("У файлі сопоставлень немає жодного правила.")
         return ArticleMappings({source: tuple(dict.fromkeys(targets)) for source, targets in mappings.items()})
@@ -647,11 +626,20 @@ def plan_prices(
     errors: list[PricePlan] = []
     mappings = mappings or ArticleMappings.empty()
     for row in rows:
+        products: dict[str, CatalogProduct] = {}
+        resolution_errors: list[str] = []
         for target_article in mappings.targets_for(row.display_article, normalize_articles):
             product, error = catalog.resolve(target_article, normalize_articles)
-            if error or product is None:
-                errors.append(PricePlan("", target_article, {}, (row,), error=error))
-            elif product.article in grouped:
+            if product is not None:
+                products[product.article] = product
+            elif error and "не знайдений у каталозі" not in error:
+                resolution_errors.append(error)
+        if not products:
+            error = resolution_errors[0] if resolution_errors else f"Жоден варіант артикула для '{row.display_article}' не знайдений у каталозі."
+            errors.append(PricePlan("", row.display_article, {}, (row,), error=error))
+            continue
+        for product in products.values():
+            if product.article in grouped:
                 errors.append(PricePlan(product.article, product.display_article or product.article, {}, (row,), error="Артикул повторюється у файлі або базі сопоставлень. Для товару має бути лише одна команда."))
             else:
                 grouped[product.article] = row

@@ -104,6 +104,18 @@ class HoroshopPricesTests(unittest.TestCase):
         self.assertEqual([plan.article for plan in plans], ["REAL-1", "REAL-2"])
         self.assertEqual([plan.payload["price"] for plan in plans], [900.0, 900.0])
 
+    def test_mapping_row_uses_every_article_variant_including_internal_article(self):
+        catalog = CatalogIndex.from_raw([{"article": "TECH/1 (A)", "article_for_display": "Visible-1", "price": 1000, "price_old": 1000, "wholesale_prices": []}])
+        mappings = parse_article_mappings(self.excel(
+            ["Артикул постачальника", "Артикул для відображення", "Технічний артикул"],
+            [("SELLER-1", "Visible-1", "TECH/1 (A)")],
+        ))
+        row = PriceRow("SELLER-1", FieldChange(Decimal("900")), None, FieldChange(), False, False, (), 2)
+        plans = plan_prices([row], catalog, self.settings(), mappings=mappings)
+        self.assertEqual(mappings.targets_for("Visible-1", False), ("SELLER-1", "Visible-1", "TECH/1 (A)"))
+        self.assertEqual([plan.article for plan in plans], ["TECH/1 (A)"])
+        self.assertEqual(plans[0].payload["price"], 900.0)
+
     def test_mapping_database_merges_and_persists_rules(self):
         initial = ArticleMappings({"SET-1": ("REAL-1",)})
         additional = ArticleMappings({"SET-1": ("REAL-2",), "SET-2": ("REAL-3",)})
