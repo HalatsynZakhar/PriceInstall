@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from horoshop_prices import (
     ArticleMappings, CatalogIndex, Credentials, FieldChange, HoroshopClient, HoroshopPricesError, PricePlan, PriceRow, Settings, WholesaleChange,
-    build_excel_template, build_failed_excel, import_results, load_article_mappings, load_settings, normalize, parse_article_mappings,
+    build_excel_template, build_failed_excel, build_report_excel, import_results, load_article_mappings, load_settings, normalize, parse_article_mappings,
     parse_decimal, parse_excel_prices, parse_price_type, parse_threshold, plan_prices, save_article_mappings,
 )
 
@@ -90,6 +90,8 @@ def serialise(plan: PricePlan, status: str | None = None, message: str = "") -> 
     changes: list[str] = []
     if row.current.value is not None:
         changes.append(f"Поточна ціна: {row.current.value}")
+    elif "price" in plan.payload and row.current_percent_of_old is None and not row.move_old_to_current:
+        changes.append(f"Поточна ціна: {plan.payload['price']} (синхронізовано з РРЦ)")
     if row.current_percent_of_old is not None:
         changes.append(f"Поточна ціна: {row.current_percent_of_old}% від РРЦ")
     if row.old.value is not None:
@@ -120,12 +122,23 @@ def with_failed_excel(result: dict[str, Any], failures: list[tuple[PricePlan, st
     return result
 
 
+def with_report_excel(result: dict[str, Any], plans: list[PricePlan], filename: str = "horoshop_prices_report.xlsx") -> dict[str, Any]:
+    if plans:
+        result["report_excel"] = base64.b64encode(build_report_excel(plans)).decode("ascii")
+        result["report_excel_name"] = filename
+    return result
+
+
 def preview_rows(rows: list[PriceRow], credentials: Credentials, normalize_articles: bool, mappings: ArticleMappings) -> dict[str, Any]:
     catalog, _ = catalog_for(credentials)
     plans = plan_prices(rows, catalog, get_settings(), normalize_articles, mappings)
     items = [serialise(plan) for plan in plans]
     failures = [(plan, "Помилка", item["message"]) for plan, item in zip(plans, items) if not plan.ready]
-    return with_failed_excel({"items": items, "ready": sum(plan.ready for plan in plans), "errors": len(failures)}, failures)
+    ready_plans = [plan for plan in plans if plan.ready]
+    result = {"items": items, "ready": len(ready_plans), "errors": len(failures)}
+    result = with_failed_excel(result, failures)
+    result = with_report_excel(result, ready_plans, "horoshop_prices_preview.xlsx")
+    return result
 
 
 def execute_rows(rows: list[PriceRow], credentials: Credentials, normalize_articles: bool = True, mappings: ArticleMappings | None = None) -> dict[str, Any]:
@@ -137,6 +150,7 @@ def execute_rows(rows: list[PriceRow], credentials: Credentials, normalize_artic
         api_results.update(import_results(client.import_products(payload[start:start + get_settings().batch_size])))
     items: list[dict[str, Any]] = []
     failures: list[tuple[PricePlan, str, str]] = []
+    successful_plans: list[PricePlan] = []
     for plan in plans:
         if not plan.ready:
             item = serialise(plan, "invalid")
@@ -147,9 +161,14 @@ def execute_rows(rows: list[PriceRow], credentials: Credentials, normalize_artic
         joined = "; ".join(item for item in ("; ".join(plan.warnings), message) if item)
         item = serialise(plan, "synced" if success else "error", joined)
         items.append(item)
-        if not success:
+        if success:
+            successful_plans.append(plan)
+        else:
             failures.append((plan, "Помилка API", item["message"]))
-    return with_failed_excel({"items": items, "imported": sum(item["status"] == "synced" for item in items), "errors": sum(item["status"] in {"error", "invalid"} for item in items)}, failures)
+    result = {"items": items, "imported": sum(item["status"] == "synced" for item in items), "errors": sum(item["status"] in {"error", "invalid"} for item in items)}
+    result = with_failed_excel(result, failures)
+    result = with_report_excel(result, successful_plans, "horoshop_prices_report.xlsx")
+    return result
 
 
 def parse_bool(value: Any, default: bool = False) -> bool:

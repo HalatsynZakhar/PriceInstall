@@ -109,6 +109,7 @@ class PricePlan:
     rows: tuple[PriceRow, ...]
     warnings: tuple[str, ...] = ()
     error: str = ""
+    catalog_product: CatalogProduct | None = None
 
     @property
     def ready(self) -> bool:
@@ -498,6 +499,128 @@ def build_failed_excel(failures: list[tuple[PricePlan, str, str]]) -> bytes:
     return output.getvalue()
 
 
+def _extract_wholesale_pairs(wholesale_data: Any) -> list[tuple[float, int]]:
+    pairs: list[tuple[float, int]] = []
+    if isinstance(wholesale_data, (list, tuple)):
+        for item in wholesale_data:
+            if isinstance(item, dict):
+                threshold = item.get("minimal_threshold") or item.get("threshold")
+                price = item.get("price")
+                if threshold is not None and price is not None:
+                    try:
+                        pairs.append((float(price), int(threshold)))
+                    except (ValueError, TypeError):
+                        pass
+    pairs.sort(key=lambda pair: pair[1])
+    return pairs
+
+
+def build_report_excel(plans: list[PricePlan]) -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Детальний звіт цін"
+    headers = [
+        "Рядок",
+        "Артикул у файлі",
+        "Артикул сайту",
+        "Внутрішній артикул Хорошоп",
+        "Стара поточна ціна (грн)",
+        "Нова поточна ціна (грн)",
+        "Стара РРЦ (грн)",
+        "Нова РРЦ (грн)",
+    ]
+    for tier in range(1, 6):
+        headers.extend([
+            f"Старий Опт {tier} (грн)",
+            f"Старий Опт {tier} від (шт.)",
+            f"Новий Опт {tier} (грн)",
+            f"Новий Опт {tier} від (шт.)",
+        ])
+    headers.extend(["Зміни", "Примітки"])
+    sheet.append(headers)
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = f"A1:{sheet.cell(row=1, column=len(headers)).coordinate}"
+
+    for plan in plans:
+        row = plan.rows[0]
+        product = plan.catalog_product
+        user_article = row.display_article
+        site_article = (product.display_article if product else "") or plan.display_article
+        internal_article = plan.article
+        row_number = row.row_number
+
+        old_current = float(product.price) if product and product.price is not None else ""
+        new_current = float(plan.payload["price"]) if "price" in plan.payload else old_current
+
+        old_rrc = float(product.price_old) if product and product.price_old is not None else ""
+        if "price_old" in plan.payload:
+            new_rrc = float(plan.payload["price_old"]) if plan.payload["price_old"] else "Видалено"
+        else:
+            new_rrc = old_rrc
+
+        old_wholesale_pairs = _extract_wholesale_pairs(product.wholesale_prices) if product else []
+        if "wholesale_prices" in plan.payload:
+            new_wholesale_pairs = _extract_wholesale_pairs(plan.payload["wholesale_prices"])
+        else:
+            new_wholesale_pairs = old_wholesale_pairs
+
+        wholesale_values: list[Any] = []
+        for tier_idx in range(5):
+            old_price = old_wholesale_pairs[tier_idx][0] if tier_idx < len(old_wholesale_pairs) else ""
+            old_threshold = old_wholesale_pairs[tier_idx][1] if tier_idx < len(old_wholesale_pairs) else ""
+            new_price = new_wholesale_pairs[tier_idx][0] if tier_idx < len(new_wholesale_pairs) else ""
+            new_threshold = new_wholesale_pairs[tier_idx][1] if tier_idx < len(new_wholesale_pairs) else ""
+            wholesale_values.extend([old_price, old_threshold, new_price, new_threshold])
+
+        changes: list[str] = []
+        if "price" in plan.payload:
+            if old_current != "" and old_current != new_current:
+                changes.append(f"Поточна ціна: {old_current} -> {new_current}")
+            else:
+                changes.append(f"Поточна ціна: {new_current}")
+        if "price_old" in plan.payload:
+            if old_rrc != "" and old_rrc != new_rrc:
+                changes.append(f"РРЦ: {old_rrc} -> {new_rrc}")
+            else:
+                changes.append(f"РРЦ: {new_rrc}")
+        if "wholesale_prices" in plan.payload:
+            changes.append("Опт оновлено")
+
+        sheet.append([
+            row_number,
+            user_article,
+            site_article,
+            internal_article,
+            old_current,
+            new_current,
+            old_rrc,
+            new_rrc,
+        ] + wholesale_values + [
+            "; ".join(changes),
+            "; ".join(plan.warnings),
+        ])
+
+    widths: dict[str, int] = {
+        "A": 10, "B": 24, "C": 26, "D": 26, "E": 20, "F": 20, "G": 16, "H": 16,
+    }
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
+    for index in range(9, len(headers) - 1):
+        sheet.column_dimensions[sheet.cell(row=1, column=index).column_letter].width = 16
+    sheet.column_dimensions[sheet.cell(row=1, column=len(headers) - 1).column_letter].width = 35
+    sheet.column_dimensions[sheet.cell(row=1, column=len(headers)).column_letter].width = 45
+
+    _style_header(sheet)
+    for row_cells in sheet.iter_rows(min_row=2):
+        row_cells[-1].alignment = Alignment(wrap_text=True, vertical="top")
+        row_cells[-2].alignment = Alignment(wrap_text=True, vertical="top")
+
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
+
+
 def _style_header(worksheet: Any) -> None:
     for cell in worksheet[1]:
         cell.font = Font(bold=True, color="FFFFFF")
@@ -663,6 +786,14 @@ def plan_prices(
         has_current = row.current.value is not None or row.current_percent_of_old is not None or row.move_old_to_current
         has_old = row.old.specified or row.move_current_to_old
         direct_wholesale = bool(row.wholesale)
+        wholesale = wholesale_entries(product.wholesale_prices)
+        warnings: list[str] = []
+        if row.move_current_to_old:
+            old = product.price
+        elif row.old.delete:
+            old = None
+        elif row.old.value is not None:
+            old = row.old.value
         if row.move_old_to_current:
             current = product.price_old
         elif row.current_percent_of_old is not None:
@@ -672,21 +803,19 @@ def plan_prices(
             current = (old * row.current_percent_of_old / Decimal("100")).quantize(Decimal("1"), rounding=ROUND_DOWN)
         elif row.current.value is not None:
             current = row.current.value
-        if row.move_current_to_old:
-            old = product.price
-        elif row.old.delete:
-            old = None
-        elif row.old.value is not None:
-            old = row.old.value
+        elif row.old.value is not None and not has_current:
+            if product.price is not None and product.price_old is not None and product.price == product.price_old:
+                current = old
+                has_current = True
+                warnings.append("Поточну ціну встановлено в значення нової РРЦ (до зміни ціни збігалися).")
         if row.move_old_to_current and product.price_old is None:
             plans.append(PricePlan(article, product.display_article or article, {}, (row,), error="Немає РРЦ, яке можна перенести в поточну ціну."))
             continue
         if current is None:
             plans.append(PricePlan(article, product.display_article or article, {}, (row,), error="Немає поточної ціни: спочатку встановіть «Поточна ціна«."))
             continue
-        wholesale = wholesale_entries(product.wholesale_prices)
-        warnings: list[str] = []
-        if (has_current or has_old) and settings.recalculate_wholesale_from_rrc and old is not None:
+        recalculate_wholesale = (has_current or has_old) and settings.recalculate_wholesale_from_rrc and old is not None
+        if recalculate_wholesale:
             for rule in settings.wholesale_rules:
                 if rule.tier <= 3:
                     wholesale[rule.minimal_threshold] = (old * (Decimal("100") - rule.discount_percent) / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -714,9 +843,9 @@ def plan_prices(
             payload: dict[str, Any] = {"article": article}
             if has_current: payload["price"] = float(current)
             if has_old: payload["price_old"] = float(old) if old else 0
-            if has_current or direct_wholesale:
+            if has_current or direct_wholesale or recalculate_wholesale:
                 payload["wholesale_prices"] = [{"minimal_threshold": threshold, "price": float(value)} for threshold, value in sorted(wholesale.items())]
-            plans.append(PricePlan(article, product.display_article or article, payload, (row,), tuple(warnings)))
+            plans.append(PricePlan(article, product.display_article or article, payload, (row,), tuple(warnings), catalog_product=product))
     return sorted(plans, key=lambda plan: min(row.row_number for row in plan.rows))
 
 

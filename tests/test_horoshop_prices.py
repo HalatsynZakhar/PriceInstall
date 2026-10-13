@@ -8,7 +8,7 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-from horoshop_prices import ArticleMappings, CatalogIndex, FieldChange, PricePlan, PriceRow, WholesaleChange, build_excel_template, build_failed_excel, load_article_mappings, load_settings, normalize_article_code, parse_article_mappings, parse_excel_prices, plan_prices, save_article_mappings
+from horoshop_prices import ArticleMappings, CatalogIndex, FieldChange, PricePlan, PriceRow, WholesaleChange, build_excel_template, build_failed_excel, build_report_excel, load_article_mappings, load_settings, normalize_article_code, parse_article_mappings, parse_excel_prices, plan_prices, save_article_mappings
 
 
 class HoroshopPricesTests(unittest.TestCase):
@@ -62,6 +62,34 @@ class HoroshopPricesTests(unittest.TestCase):
         row = PriceRow("REAL-1", FieldChange(), Decimal("75.6"), FieldChange(), False, False, (), 2)
         plan = plan_prices([row], self.catalog(), self.settings())[0]
         self.assertEqual(plan.payload["price"], 756.0)
+
+    def test_raising_rrc_updates_current_price_if_prices_matched_and_recalculates_wholesale(self):
+        row = PriceRow("REAL-1", FieldChange(), None, FieldChange(Decimal("1200")), False, False, (), 2)
+        plan = plan_prices([row], self.catalog(), self.settings())[0]
+        self.assertEqual(plan.payload["price"], 1200.0)
+        self.assertEqual(plan.payload["price_old"], 1200.0)
+        self.assertEqual(plan.payload["wholesale_prices"], [
+            {"minimal_threshold": 2, "price": 1080.0},
+            {"minimal_threshold": 5, "price": 1020.0},
+            {"minimal_threshold": 10, "price": 900.0},
+            {"minimal_threshold": 20, "price": 700.0},
+        ])
+        self.assertIn("Поточну ціну встановлено в значення нової РРЦ", "; ".join(plan.warnings))
+
+    def test_raising_rrc_does_not_update_current_price_if_item_was_discounted_but_recalculates_wholesale(self):
+        discounted_catalog = CatalogIndex.from_raw([{"article":"REAL-1","article_for_display":"Display-1","price":800,"price_old":1000,"wholesale_prices":[{"minimal_threshold":2,"price":900},{"minimal_threshold":20,"price":700}]}])
+        row = PriceRow("REAL-1", FieldChange(), None, FieldChange(Decimal("1200")), False, False, (), 2)
+        plan = plan_prices([row], discounted_catalog, self.settings())[0]
+        self.assertNotIn("price", plan.payload)
+        self.assertEqual(plan.payload["price_old"], 1200.0)
+        self.assertEqual(plan.payload["wholesale_prices"], [{"minimal_threshold": 20, "price": 700.0}])
+
+    def test_raising_rrc_with_explicit_current_price_respects_explicit_price(self):
+        row = PriceRow("REAL-1", FieldChange(Decimal("1100")), None, FieldChange(Decimal("1200")), False, False, (), 2)
+        plan = plan_prices([row], self.catalog(), self.settings())[0]
+        self.assertEqual(plan.payload["price"], 1100.0)
+        self.assertEqual(plan.payload["price_old"], 1200.0)
+        self.assertEqual(len(plan.payload["wholesale_prices"]), 4)
 
     def test_excel_supports_one_row_and_reordered_columns(self):
         rows = parse_excel_prices(self.excel(["Опт 1", "Артикул", "Поточна ціна", "Поточну ціну в РРЦ (Так)", "Опт 1 від"], [(800, "A", 900, "Так", 3)]))
@@ -157,6 +185,51 @@ class HoroshopPricesTests(unittest.TestCase):
         self.assertEqual(values[11], 800)
         self.assertEqual(values[12], 3)
         workbook.close()
+
+    def test_report_excel_contains_all_old_and_new_prices_and_display_articles(self):
+        mappings = ArticleMappings({"Input-Article": ("Display-1",)})
+        row = PriceRow("Input-Article", FieldChange(), None, FieldChange(Decimal("1200")), False, False, (), 3)
+        plan = plan_prices([row], self.catalog(), self.settings(), mappings=mappings)[0]
+        data = build_report_excel([plan])
+        workbook = load_workbook(io.BytesIO(data), read_only=True)
+        self.assertIn("Детальний звіт цін", workbook.sheetnames)
+        sheet = workbook["Детальний звіт цін"]
+        headers = [cell for cell in next(sheet.iter_rows(min_row=1, max_row=1, values_only=True))]
+        self.assertEqual(headers[0], "Рядок")
+        self.assertEqual(headers[1], "Артикул у файлі")
+        self.assertEqual(headers[2], "Артикул сайту")
+        self.assertEqual(headers[3], "Внутрішній артикул Хорошоп")
+        self.assertEqual(headers[4], "Стара поточна ціна (грн)")
+        self.assertEqual(headers[5], "Нова поточна ціна (грн)")
+        self.assertEqual(headers[6], "Стара РРЦ (грн)")
+        self.assertEqual(headers[7], "Нова РРЦ (грн)")
+        self.assertEqual(headers[8], "Старий Опт 1 (грн)")
+        self.assertEqual(headers[9], "Старий Опт 1 від (шт.)")
+        self.assertEqual(headers[10], "Новий Опт 1 (грн)")
+        self.assertEqual(headers[11], "Новий Опт 1 від (шт.)")
+
+        values = next(sheet.iter_rows(min_row=2, max_row=2, values_only=True))
+        self.assertEqual(values[0], 3)
+        self.assertEqual(values[1], "Input-Article")
+        self.assertEqual(values[2], "Display-1")
+        self.assertEqual(values[3], "REAL-1")
+        self.assertEqual(values[4], 1000.0)
+        self.assertEqual(values[5], 1200.0)
+        self.assertEqual(values[6], 1000.0)
+        self.assertEqual(values[7], 1200.0)
+        self.assertEqual(values[8], 900.0)
+        self.assertEqual(values[9], 2)
+        self.assertEqual(values[10], 1080.0)
+        self.assertEqual(values[11], 2)
+        workbook.close()
+
+    def test_with_report_excel_encodes_base64_report(self):
+        from price_server import with_report_excel
+        row = PriceRow("REAL-1", FieldChange(Decimal("1100")), None, FieldChange(), False, False, (), 1)
+        plan = plan_prices([row], self.catalog(), self.settings())[0]
+        result = with_report_excel({}, [plan], "custom_report.xlsx")
+        self.assertIn("report_excel", result)
+        self.assertEqual(result["report_excel_name"], "custom_report.xlsx")
 
 
 if __name__ == "__main__":
