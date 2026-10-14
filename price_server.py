@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from horoshop_prices import (
     ArticleMappings, CatalogIndex, Credentials, FieldChange, HoroshopClient, HoroshopPricesError, PricePlan, PriceRow, Settings, WholesaleChange,
-    build_excel_template, build_failed_excel, build_report_excel, import_results, load_article_mappings, load_settings, normalize, parse_article_mappings,
+    build_excel_template, build_failed_excel, build_mappings_excel, build_report_excel, import_results, load_article_mappings, load_settings, normalize, parse_article_mappings,
     parse_decimal, parse_excel_prices, parse_price_type, parse_threshold, plan_prices, save_article_mappings,
 )
 
@@ -236,6 +236,52 @@ def index() -> HTMLResponse:
 @app.get("/api/template")
 def template() -> Response:
     return Response(build_excel_template(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": 'attachment; filename="horoshop_prices_template.xlsx"', "Cache-Control": "no-store"})
+
+
+@app.get("/api/mappings/info")
+def mappings_info() -> dict[str, int]:
+    mappings = stored_mappings()
+    return {"sources": len(mappings.entries), "rules": sum(len(targets) for targets in mappings.entries.values())}
+
+
+@app.get("/api/mappings/export")
+def export_mappings() -> Response:
+    content = build_mappings_excel(stored_mappings())
+    return Response(
+        content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="horoshop_article_mappings.xlsx"', "Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/mappings/clear")
+async def clear_mappings() -> dict[str, Any]:
+    with mapping_lock:
+        backup_name = ""
+        if MAPPINGS_FILE.exists():
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = MAPPINGS_FILE.with_name(f"article_mappings_{timestamp}.json.bak")
+            latest_bak = MAPPINGS_FILE.with_suffix(".json.bak")
+            try:
+                content = MAPPINGS_FILE.read_text(encoding="utf-8")
+                backup_file.write_text(content, encoding="utf-8")
+                latest_bak.write_text(content, encoding="utf-8")
+                backup_name = backup_file.name
+            except OSError as error:
+                logger.warning("Could not backup mappings file: %s", error)
+        save_article_mappings(MAPPINGS_FILE, ArticleMappings.empty())
+        return {"status": "cleared", "backup": backup_name}
+
+
+@app.post("/api/server/restart")
+async def restart_service() -> dict[str, str]:
+    def do_exit() -> None:
+        import time, os
+        time.sleep(0.5)
+        os._exit(0)
+    threading.Thread(target=do_exit, daemon=True).start()
+    return {"status": "restarting"}
 
 
 @app.post("/api/mappings")

@@ -117,16 +117,33 @@ class PricePlan:
 
 
 def normalize(value: Any) -> str:
-    return "" if value is None else str(value).strip()
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def leading_zeros_count(text: str) -> int:
+    count = 0
+    for character in text:
+        if character == "0":
+            count += 1
+        else:
+            break
+    return count
 
 
 def normalize_article_code(value: Any) -> str:
     text = normalize(value)
     if not text:
         return ""
-    text = "".join(character if character.isalnum() else "-" for character in text)
-    text = re.sub(r"-{2,}", "-", text)
-    return text.strip("-")
+    raw_alpha = "".join(character if character.isalnum() else "-" for character in text).strip("-")
+    zeros = leading_zeros_count(raw_alpha)
+    cleaned = re.sub(r"-{2,}", "-", raw_alpha)
+    if zeros > 0 and not cleaned.startswith("0" * zeros):
+        cleaned = ("0" * zeros) + cleaned.lstrip("0")
+    return cleaned
 
 
 def endpoint_url(domain: str, endpoint: str) -> str:
@@ -241,7 +258,12 @@ class ArticleMappings:
         combined = {source: list(targets) for source, targets in self.entries.items()}
         for source, targets in other.entries.items():
             combined.setdefault(source, []).extend(targets)
-        return ArticleMappings({source: tuple(dict.fromkeys(targets)) for source, targets in combined.items()})
+        result: dict[str, tuple[str, ...]] = {}
+        for source, targets in combined.items():
+            deduped = tuple(dict.fromkeys(targets))
+            if any(target.casefold() != source.casefold() for target in deduped):
+                result[source] = deduped
+        return ArticleMappings(result)
 
     def targets_for(self, article: str, use_normalized: bool) -> tuple[str, ...]:
         if not self.entries:
@@ -254,8 +276,14 @@ class ArticleMappings:
         if len(folded_matches) == 1:
             return folded_matches[0]
         if use_normalized:
-            normalized = normalize_article_code(article).casefold()
-            normalized_matches = [targets for source, targets in self.entries.items() if normalize_article_code(source).casefold() == normalized]
+            norm_article = normalize_article_code(article)
+            zeros = leading_zeros_count(norm_article)
+            normalized = norm_article.casefold()
+            normalized_matches = [
+                targets for source, targets in self.entries.items()
+                if normalize_article_code(source).casefold() == normalized
+                and leading_zeros_count(normalize_article_code(source)) == zeros
+            ]
             if len(normalized_matches) == 1:
                 return normalized_matches[0]
         return (article,)
@@ -390,30 +418,52 @@ def parse_article_mappings(data: bytes) -> ArticleMappings:
             first_row = next(iterator)
         except StopIteration as error:
             raise ValueError("Файл сопоставлень порожній.") from error
-        if is_mapping_header(first_row):
+        has_header = is_mapping_header(first_row)
+        if has_header:
             column_indexes = mapping_column_indexes(first_row)
             rows = iterator
+            start_row = 2
         else:
             column_indexes = tuple(range(len(first_row)))
             rows = chain((first_row,), iterator)
+            start_row = 1
         mappings: dict[str, list[str]] = {}
-        for row in rows:
+        for row_number, row in enumerate(rows, start=start_row):
             if not row or all(value is None for value in row):
                 continue
-            articles = list(dict.fromkeys(
-                normalize(row[index] if index < len(row) else None)
-                for index in column_indexes
-                if normalize(row[index] if index < len(row) else None)
-            ))
-            if not articles:
+            if has_header:
+                raw_articles = [
+                    normalize(row[index] if index < len(row) else None)
+                    for index in column_indexes
+                    if normalize(row[index] if index < len(row) else None)
+                ]
+            else:
+                raw_articles = [normalize(value) for value in row if normalize(value)]
+            unique_articles: list[str] = list(dict.fromkeys(raw_articles))
+            if len(unique_articles) < 2:
                 continue
-            if len(articles) < 2:
+            if len({a.casefold() for a in unique_articles}) < 2:
                 continue
-            for source in articles:
-                mappings.setdefault(source, []).extend(articles)
-        if not mappings:
-            raise ValueError("У файлі сопоставлень немає жодного правила.")
-        return ArticleMappings({source: tuple(dict.fromkeys(targets)) for source, targets in mappings.items()})
+            for i in range(len(unique_articles)):
+                for j in range(i + 1, len(unique_articles)):
+                    a, b = unique_articles[i], unique_articles[j]
+                    if a.lstrip("0") == b.lstrip("0") and a != b:
+                        raise ValueError(
+                            f"Рядок {row_number}: артикули «{a}» та «{b}» відрізняються лише початковими нулями (це різні бренди/товари). "
+                            f"Їх заборонено зіставляти один з одним."
+                        )
+            for source in unique_articles:
+                mappings.setdefault(source, []).extend(unique_articles)
+
+        final_entries: dict[str, tuple[str, ...]] = {}
+        for source, targets in mappings.items():
+            deduped = tuple(dict.fromkeys(targets))
+            if any(target.casefold() != source.casefold() for target in deduped):
+                final_entries[source] = deduped
+
+        if not final_entries:
+            raise ValueError("У файлі сопоставлень немає жодного корисного правила (усі рядки порожні, містять лише один артикул або однакові значення).")
+        return ArticleMappings(final_entries)
     finally:
         workbook.close()
 
@@ -435,7 +485,8 @@ def load_article_mappings(path: Path) -> ArticleMappings:
         target_articles = tuple(dict.fromkeys(normalize(target) for target in targets if normalize(target)))
         if not target_articles:
             raise HoroshopPricesError("База сопоставлень має некоректний формат.")
-        entries[source_article] = target_articles
+        if any(target.casefold() != source_article.casefold() for target in target_articles):
+            entries[source_article] = target_articles
     return ArticleMappings(entries)
 
 
@@ -672,6 +723,75 @@ def build_excel_template() -> bytes:
     return output.getvalue()
 
 
+def extract_clusters(mappings: ArticleMappings) -> list[list[str]]:
+    visited: set[str] = set()
+    clusters: list[list[str]] = []
+    for source in sorted(mappings.entries.keys()):
+        if source in visited:
+            continue
+        cluster: list[str] = []
+        queue = [source]
+        visited.add(source)
+        while queue:
+            current = queue.pop(0)
+            cluster.append(current)
+            for target in mappings.entries.get(current, ()):
+                if target not in visited:
+                    visited.add(target)
+                    queue.append(target)
+        if len(cluster) >= 2:
+            clusters.append(sorted(cluster))
+    clusters.sort(key=lambda item: item[0])
+    return clusters
+
+
+def build_mappings_excel(mappings: ArticleMappings) -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Таблиця сопоставлень"
+
+    clusters = extract_clusters(mappings)
+    max_cols = max((len(item) for item in clusters), default=2)
+    max_cols = max(max_cols, 2)
+
+    headers = [f"Артикул {index}" for index in range(1, max_cols + 1)]
+    sheet.append(headers)
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = f"A1:{sheet.cell(row=1, column=len(headers)).coordinate}"
+    _style_header(sheet)
+
+    for row_index, cluster in enumerate(clusters, start=2):
+        row_values = list(cluster) + [""] * (max_cols - len(cluster))
+        sheet.append(row_values)
+        for column_index in range(1, max_cols + 1):
+            sheet.cell(row=row_index, column=column_index).number_format = "@"
+
+    for column_index in range(1, max_cols + 1):
+        column_letter = sheet.cell(row=1, column=column_index).column_letter
+        sheet.column_dimensions[column_letter].width = 30
+
+    register_sheet = workbook.create_sheet("Повний реєстр")
+    register_headers = ["Пошуковий артикул", "Кількість відповідностей", "Всі відповідні артикули"]
+    register_sheet.append(register_headers)
+    register_sheet.freeze_panes = "A2"
+    register_sheet.auto_filter.ref = "A1:C1"
+    _style_header(register_sheet)
+
+    for row_index, (source, targets) in enumerate(sorted(mappings.entries.items()), start=2):
+        register_sheet.append([source, len(targets), ", ".join(targets)])
+        register_sheet.cell(row=row_index, column=1).number_format = "@"
+        register_sheet.cell(row=row_index, column=3).number_format = "@"
+
+    register_sheet.column_dimensions["A"].width = 28
+    register_sheet.column_dimensions["B"].width = 24
+    register_sheet.column_dimensions["C"].width = 60
+
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
+
+
 class CatalogIndex:
     def __init__(self, products: list[CatalogProduct]) -> None:
         self.products = products
@@ -713,12 +833,22 @@ class CatalogIndex:
         if len(folded) > 1:
             return None, f"Артикул '{value}' не є унікальним."
         if use_normalized:
-            normalized = normalize_article_code(value)
-            normalized_matches = list({item.article: item for item in self.by_normalized.get(normalized.casefold(), [])}.values())
+            norm_val = normalize_article_code(value)
+            zeros = leading_zeros_count(norm_val)
+            normalized = norm_val.casefold()
+            candidates = self.by_normalized.get(normalized, [])
+            valid_candidates = []
+            for item in candidates:
+                for key in {item.article, item.display_article} - {""}:
+                    norm_k = normalize_article_code(key)
+                    if norm_k.casefold() == normalized and leading_zeros_count(norm_k) == zeros:
+                        valid_candidates.append(item)
+                        break
+            normalized_matches = list({item.article: item for item in valid_candidates}.values())
             if len(normalized_matches) == 1:
                 return normalized_matches[0], ""
             if len(normalized_matches) > 1:
-                return None, f"Нормалізований артикул '{normalized}' для '{value}' не є унікальним."
+                return None, f"Нормалізований артикул '{norm_val}' для '{value}' не є унікальним."
         return None, f"Артикул '{value}' не знайдений у каталозі."
 
 

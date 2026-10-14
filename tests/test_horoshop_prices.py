@@ -8,7 +8,12 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-from horoshop_prices import ArticleMappings, CatalogIndex, FieldChange, PricePlan, PriceRow, WholesaleChange, build_excel_template, build_failed_excel, build_report_excel, load_article_mappings, load_settings, normalize_article_code, parse_article_mappings, parse_excel_prices, plan_prices, save_article_mappings
+from horoshop_prices import (
+    ArticleMappings, CatalogIndex, FieldChange, PricePlan, PriceRow, WholesaleChange,
+    build_excel_template, build_failed_excel, build_mappings_excel, build_report_excel, extract_clusters,
+    leading_zeros_count, load_article_mappings, load_settings, normalize_article_code,
+    parse_article_mappings, parse_excel_prices, plan_prices, save_article_mappings,
+)
 
 
 class HoroshopPricesTests(unittest.TestCase):
@@ -230,6 +235,128 @@ class HoroshopPricesTests(unittest.TestCase):
         result = with_report_excel({}, [plan], "custom_report.xlsx")
         self.assertIn("report_excel", result)
         self.assertEqual(result["report_excel_name"], "custom_report.xlsx")
+
+    def test_leading_zeros_preserved_in_normalize_article_code(self):
+        self.assertEqual(normalize_article_code("04040"), "04040")
+        self.assertEqual(normalize_article_code("04055"), "04055")
+        self.assertEqual(normalize_article_code("4040"), "4040")
+        self.assertEqual(normalize_article_code("4055"), "4055")
+        self.assertEqual(normalize_article_code("004040"), "004040")
+        self.assertEqual(normalize_article_code("  04040  "), "04040")
+        self.assertEqual(leading_zeros_count("04040"), 1)
+        self.assertEqual(leading_zeros_count("4040"), 0)
+
+    def test_mapping_targets_for_never_matches_different_leading_zeros(self):
+        mappings = ArticleMappings({
+            "04040": ("04040", "TARGET-04040"),
+            "4040": ("4040", "TARGET-4040"),
+            "04055": ("04055", "TARGET-04055"),
+            "4055": ("4055", "TARGET-4055"),
+        })
+        self.assertEqual(mappings.targets_for("04040", False), ("04040", "TARGET-04040"))
+        self.assertEqual(mappings.targets_for("4040", False), ("4040", "TARGET-4040"))
+        self.assertEqual(mappings.targets_for("04040", True), ("04040", "TARGET-04040"))
+        self.assertEqual(mappings.targets_for("4040", True), ("4040", "TARGET-4040"))
+        mappings_only_zero = ArticleMappings({"04040": ("04040", "TARGET-04040")})
+        self.assertEqual(mappings_only_zero.targets_for("4040", True), ("4040",))
+        mappings_only_non_zero = ArticleMappings({"4040": ("4040", "TARGET-4040")})
+        self.assertEqual(mappings_only_non_zero.targets_for("04040", True), ("04040",))
+
+    def test_catalog_resolve_never_matches_different_leading_zeros(self):
+        catalog = CatalogIndex.from_raw([
+            {"article": "INT-04040", "article_for_display": "04040", "price": 100, "price_old": 100, "wholesale_prices": []},
+            {"article": "INT-4040", "article_for_display": "4040", "price": 200, "price_old": 200, "wholesale_prices": []},
+        ])
+        prod_0, _ = catalog.resolve("04040", use_normalized=True)
+        prod_no_0, _ = catalog.resolve("4040", use_normalized=True)
+        self.assertIsNotNone(prod_0)
+        self.assertEqual(prod_0.article, "INT-04040")
+        self.assertIsNotNone(prod_no_0)
+        self.assertEqual(prod_no_0.article, "INT-4040")
+
+        catalog_only_zero = CatalogIndex.from_raw([
+            {"article": "INT-04040", "article_for_display": "04040", "price": 100, "price_old": 100, "wholesale_prices": []},
+        ])
+        prod_failed, err = catalog_only_zero.resolve("4040", use_normalized=True)
+        self.assertIsNone(prod_failed)
+        self.assertIn("не знайдений у каталозі", err)
+
+    def test_parse_article_mappings_skips_useless_rows(self):
+        mappings = parse_article_mappings(self.excel(
+            ["Варіант 1", "Варіант 2", "Варіант 3"],
+            [
+                ("SINGLE-ONLY", "", ""),
+                ("DUPLICATE", "DUPLICATE", ""),
+                ("CASE-A", "case-a", ""),
+                (" 123 ", "123", ""),
+                ("04040", "VALID-1", ""),
+            ],
+        ))
+        self.assertEqual(set(mappings.entries.keys()), {"04040", "VALID-1"})
+        self.assertNotIn("SINGLE-ONLY", mappings.entries)
+        self.assertNotIn("DUPLICATE", mappings.entries)
+        self.assertNotIn("CASE-A", mappings.entries)
+
+    def test_parse_article_mappings_rejects_conflicting_leading_zeros_in_same_row(self):
+        with self.assertRaisesRegex(ValueError, "відрізняються лише початковими нулями"):
+            parse_article_mappings(self.excel(
+                ["Варіант 1", "Варіант 2"],
+                [("04040", "4040")],
+            ))
+        with self.assertRaisesRegex(ValueError, "відрізняються лише початковими нулями"):
+            parse_article_mappings(self.excel(
+                ["Варіант 1", "Варіант 2"],
+                [("04055", "4055")],
+            ))
+
+    def test_build_mappings_excel_roundtrip_and_clusters(self):
+        mappings = ArticleMappings({
+            "04040": ("04040", "UUID-04040"),
+            "UUID-04040": ("UUID-04040", "04040"),
+            "4040": ("4040", "UUID-4040"),
+            "UUID-4040": ("UUID-4040", "4040"),
+        })
+        excel_bytes = build_mappings_excel(mappings)
+        wb = load_workbook(io.BytesIO(excel_bytes), read_only=True)
+        self.assertIn("Таблиця сопоставлень", wb.sheetnames)
+        self.assertIn("Повний реєстр", wb.sheetnames)
+        wb.close()
+
+        restored = parse_article_mappings(excel_bytes)
+        self.assertEqual(restored.targets_for("04040", False), ("04040", "UUID-04040"))
+        self.assertEqual(restored.targets_for("4040", False), ("4040", "UUID-4040"))
+
+    def test_clear_mappings_creates_backup_and_resets(self):
+        import asyncio
+        import price_server
+        with tempfile.TemporaryDirectory() as temp_dir:
+            test_file = Path(temp_dir) / "data" / "article_mappings.json"
+            save_article_mappings(test_file, ArticleMappings({"04040": ("04040", "TARGET-1")}))
+            original_file = price_server.MAPPINGS_FILE
+            try:
+                price_server.MAPPINGS_FILE = test_file
+                info_before = price_server.mappings_info()
+                self.assertEqual(info_before["sources"], 1)
+
+                export_res = price_server.export_mappings()
+                self.assertEqual(export_res.media_type, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                self.assertTrue(len(export_res.body) > 0)
+
+                clear_res = asyncio.run(price_server.clear_mappings())
+                self.assertEqual(clear_res["status"], "cleared")
+                self.assertTrue(clear_res["backup"].endswith(".bak"))
+
+                info_after = price_server.mappings_info()
+                self.assertEqual(info_after["sources"], 0)
+                self.assertEqual(info_after["rules"], 0)
+
+                # Verify backup exists
+                backup_path = test_file.parent / clear_res["backup"]
+                self.assertTrue(backup_path.exists())
+                backup_mappings = load_article_mappings(backup_path)
+                self.assertEqual(backup_mappings.targets_for("04040", False), ("04040", "TARGET-1"))
+            finally:
+                price_server.MAPPINGS_FILE = original_file
 
 
 if __name__ == "__main__":
