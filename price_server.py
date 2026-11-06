@@ -107,10 +107,11 @@ def credentials_from(data: dict[str, Any]) -> Credentials:
     return credentials
 
 
-def catalog_for(credentials: Credentials) -> tuple[CatalogIndex, HoroshopClient]:
+def catalog_for(credentials: Credentials) -> tuple[CatalogIndex, HoroshopClient, int]:
     runtime_settings = get_settings()
     client = HoroshopClient(runtime_settings, credentials)
-    return CatalogIndex.from_raw(client.export_catalog(), mono_price_level_id=runtime_settings.mono_price_level_id), client
+    mono_level_id = client.resolve_mono_price_level_id()
+    return CatalogIndex.from_raw(client.export_catalog(), mono_price_level_id=mono_level_id), client, mono_level_id
 
 
 def serialise(plan: PricePlan, status: str | None = None, message: str = "") -> dict[str, Any]:
@@ -158,32 +159,32 @@ def with_failed_excel(result: dict[str, Any], failures: list[tuple[PricePlan, st
     return result
 
 
-def with_report_excel(result: dict[str, Any], plans: list[PricePlan], filename: str = "horoshop_prices_report.xlsx") -> dict[str, Any]:
+def with_report_excel(result: dict[str, Any], plans: list[PricePlan], filename: str = "horoshop_prices_report.xlsx", mono_level_id: int | None = None) -> dict[str, Any]:
     if plans:
         try:
-            mono_id = get_settings().mono_price_level_id
+            mono_id = mono_level_id if mono_level_id is not None else get_settings().mono_price_level_id
         except Exception:
-            mono_id = 3
+            mono_id = 4
         result["report_excel"] = base64.b64encode(build_report_excel(plans, mono_level_id=mono_id)).decode("ascii")
         result["report_excel_name"] = filename
     return result
 
 
 def preview_rows(rows: list[PriceRow], credentials: Credentials, normalize_articles: bool, mappings: ArticleMappings) -> dict[str, Any]:
-    catalog, _ = catalog_for(credentials)
-    plans = plan_prices(rows, catalog, get_settings(), normalize_articles, mappings)
+    catalog, _, mono_level_id = catalog_for(credentials)
+    plans = plan_prices(rows, catalog, get_settings(), normalize_articles, mappings, mono_price_level_id=mono_level_id)
     items = [serialise(plan) for plan in plans]
     failures = [(plan, "Помилка", item["message"]) for plan, item in zip(plans, items) if not plan.ready]
     ready_plans = [plan for plan in plans if plan.ready]
     result = {"items": items, "ready": len(ready_plans), "errors": len(failures)}
     result = with_failed_excel(result, failures)
-    result = with_report_excel(result, ready_plans, "horoshop_prices_preview.xlsx")
+    result = with_report_excel(result, ready_plans, "horoshop_prices_preview.xlsx", mono_level_id=mono_level_id)
     return result
 
 
 def execute_rows(rows: list[PriceRow], credentials: Credentials, normalize_articles: bool = True, mappings: ArticleMappings | None = None) -> dict[str, Any]:
-    catalog, client = catalog_for(credentials)
-    plans = plan_prices(rows, catalog, get_settings(), normalize_articles, mappings or ArticleMappings.empty())
+    catalog, client, mono_level_id = catalog_for(credentials)
+    plans = plan_prices(rows, catalog, get_settings(), normalize_articles, mappings or ArticleMappings.empty(), mono_price_level_id=mono_level_id)
     payload = [plan.payload for plan in plans if plan.ready]
     api_results: dict[str, tuple[bool, str]] = {}
     for start in range(0, len(payload), get_settings().batch_size):
@@ -207,7 +208,7 @@ def execute_rows(rows: list[PriceRow], credentials: Credentials, normalize_artic
             failures.append((plan, "Помилка API", item["message"]))
     result = {"items": items, "imported": sum(item["status"] == "synced" for item in items), "errors": sum(item["status"] in {"error", "invalid"} for item in items)}
     result = with_failed_excel(result, failures)
-    result = with_report_excel(result, successful_plans, "horoshop_prices_report.xlsx")
+    result = with_report_excel(result, successful_plans, "horoshop_prices_report.xlsx", mono_level_id=mono_level_id)
     return result
 
 

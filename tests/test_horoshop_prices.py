@@ -9,7 +9,7 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 
 from horoshop_prices import (
-    ArticleMappings, CatalogIndex, FieldChange, PricePlan, PriceRow, WholesaleChange,
+    ArticleMappings, CatalogIndex, Credentials, FieldChange, HoroshopClient, PricePlan, PriceRow, WholesaleChange,
     build_excel_template, build_failed_excel, build_mappings_excel, build_report_excel, extract_clusters,
     leading_zeros_count, load_article_mappings, load_settings, normalize_article_code,
     parse_article_mappings, parse_excel_prices, plan_prices, save_article_mappings,
@@ -366,37 +366,47 @@ class HoroshopPricesTests(unittest.TestCase):
         row = PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, mono=FieldChange(Decimal("1500")))
         plan = plan_prices([row], self.catalog(), self.settings())[0]
         self.assertTrue(plan.ready)
-        self.assertEqual(plan.payload["price_levels"], [{"level_id": 3, "price": 1500.0}])
+        self.assertEqual(plan.payload["price_levels"], [{"level_id": 4, "price": 1500.0}])
 
     def test_plan_prices_delete_mono_price(self):
         row = PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, mono=FieldChange(delete=True))
         plan = plan_prices([row], self.catalog(), self.settings())[0]
         self.assertTrue(plan.ready)
-        self.assertEqual(plan.payload["price_levels"], [{"level_id": 3, "price": 0}])
+        self.assertEqual(plan.payload["price_levels"], [{"level_id": 4, "price": 0}])
         self.assertIn("Ціну МОНО видалено", "; ".join(plan.warnings))
 
     def test_plan_prices_move_current_to_mono(self):
         row = PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, move_current_to_mono=True)
         plan = plan_prices([row], self.catalog(), self.settings())[0]
         self.assertTrue(plan.ready)
-        self.assertEqual(plan.payload["price_levels"], [{"level_id": 3, "price": 1000.0}])
+        self.assertEqual(plan.payload["price_levels"], [{"level_id": 4, "price": 1000.0}])
         self.assertIn("Ціну МОНО скопійовано з поточної ціни", "; ".join(plan.warnings))
 
     def test_plan_prices_move_old_to_mono(self):
         row = PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, move_old_to_mono=True)
         plan = plan_prices([row], self.catalog(), self.settings())[0]
         self.assertTrue(plan.ready)
-        self.assertEqual(plan.payload["price_levels"], [{"level_id": 3, "price": 1000.0}])
+        self.assertEqual(plan.payload["price_levels"], [{"level_id": 4, "price": 1000.0}])
         self.assertIn("Ціну МОНО скопійовано з РРЦ", "; ".join(plan.warnings))
 
     def test_plan_prices_preserves_other_price_levels(self):
         catalog = CatalogIndex.from_raw([
             {"article": "REAL-1", "article_for_display": "Display-1", "price": 1000, "price_old": 1000, "wholesale_prices": [], "price_levels": [{"level_id": 1, "price": 850.0}, {"level_id": 3, "price": 950.0}]}
-        ])
+        ], mono_price_level_id=4)
         row = PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, mono=FieldChange(Decimal("1600")))
-        plan = plan_prices([row], catalog, self.settings())[0]
+        plan = plan_prices([row], catalog, self.settings(), mono_price_level_id=4)[0]
         self.assertTrue(plan.ready)
-        self.assertEqual(plan.payload["price_levels"], [{"level_id": 1, "price": 850.0}, {"level_id": 3, "price": 1600.0}])
+        self.assertEqual(plan.payload["price_levels"], [{"level_id": 1, "price": 850.0}, {"level_id": 3, "price": 950.0}, {"level_id": 4, "price": 1600.0}])
+
+    def test_resolve_mono_price_level_id(self):
+        from unittest.mock import patch
+        client = HoroshopClient(self.settings(), Credentials())
+        with patch.object(client, "export_price_levels", return_value=[{"id": 1, "title": "Скрыть цены"}, {"id": 4, "title": "MONO"}]):
+            self.assertEqual(client.resolve_mono_price_level_id(), 4)
+        with patch.object(client, "export_price_levels", return_value=[{"id": 1, "title": "Скрыть цены"}, {"id": 9, "title": "МОНО"}]):
+            self.assertEqual(client.resolve_mono_price_level_id(), 9)
+        with patch.object(client, "export_price_levels", return_value=[]):
+            self.assertEqual(client.resolve_mono_price_level_id(), 4)
 
     def test_parse_excel_mono_columns(self):
         rows = parse_excel_prices(self.excel(
@@ -477,6 +487,25 @@ class HoroshopPricesTests(unittest.TestCase):
                 price_server.verify_auth(None)
             finally:
                 price_server.settings = old_settings
+
+    def test_preview_and_execute_rows_with_mono(self):
+        from unittest.mock import patch
+        import price_server
+        catalog = CatalogIndex.from_raw([{"article": "REAL-1", "article_for_display": "Display-1", "price": 1000, "price_old": 1000, "wholesale_prices": [], "price_levels": []}], mono_price_level_id=4)
+        mock_client = HoroshopClient(self.settings(), Credentials())
+        row = PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, mono=FieldChange(Decimal("1500")))
+        with patch.object(price_server, "get_settings", return_value=self.settings()):
+            with patch.object(price_server, "catalog_for", return_value=(catalog, mock_client, 4)):
+                with patch.object(mock_client, "import_products", return_value={"status": "OK", "code": 0, "response": {"log": [{"article": "REAL-1", "status": "OK", "code": 0}]}}):
+                    preview = price_server.preview_rows([row], Credentials(), False, ArticleMappings.empty())
+                    self.assertEqual(preview["ready"], 1)
+                    self.assertEqual(preview["errors"], 0)
+                    self.assertIn("report_excel", preview)
+
+                    exec_res = price_server.execute_rows([row], Credentials(), False, ArticleMappings.empty())
+                    self.assertEqual(exec_res["imported"], 1)
+                    self.assertEqual(exec_res["errors"], 0)
+                    self.assertIn("report_excel", exec_res)
 
 
 if __name__ == "__main__":

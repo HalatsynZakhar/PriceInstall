@@ -58,7 +58,7 @@ class Settings:
     default_token: str = ""
     auth_username: str = ""
     auth_password: str = ""
-    mono_price_level_id: int = 3
+    mono_price_level_id: int = 4
 
     @property
     def public_log_file(self) -> Path:
@@ -251,11 +251,11 @@ def load_settings(config_file: Path) -> Settings:
     auth_pass = normalize(auth_config.get("password") or raw.get("admin_password"))
     auth_user = normalize(auth_config.get("username") or raw.get("admin_username") or ("admin" if auth_pass else ""))
 
-    mono_level_raw = horoshop.get("mono_price_level_id", horoshop.get("mono_level_id", 3))
+    mono_level_raw = horoshop.get("mono_price_level_id", horoshop.get("mono_level_id", 4))
     try:
         mono_level_id = int(mono_level_raw)
     except (ValueError, TypeError):
-        mono_level_id = 3
+        mono_level_id = 4
 
     return Settings(
         domain=domain.rstrip("/"), host=normalize(server.get("host", "0.0.0.0")) or "0.0.0.0",
@@ -624,7 +624,7 @@ def _extract_wholesale_pairs(wholesale_data: Any) -> list[tuple[float, int]]:
     return pairs
 
 
-def build_report_excel(plans: list[PricePlan], mono_level_id: int = 3) -> bytes:
+def build_report_excel(plans: list[PricePlan], mono_level_id: int = 4) -> bytes:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Детальний звіт цін"
@@ -904,7 +904,7 @@ class CatalogIndex:
                     self.by_normalized.setdefault(normalized.casefold(), []).append(item)
 
     @classmethod
-    def from_raw(cls, raw_products: list[dict[str, Any]], mono_price_level_id: int = 3) -> "CatalogIndex":
+    def from_raw(cls, raw_products: list[dict[str, Any]], mono_price_level_id: int = 4) -> "CatalogIndex":
         products: list[CatalogProduct] = []
         for raw in raw_products:
             article = normalize(raw.get("article")) if isinstance(raw, dict) else ""
@@ -989,6 +989,7 @@ def plan_prices(
     settings: Settings,
     normalize_articles: bool = False,
     mappings: ArticleMappings | None = None,
+    mono_price_level_id: int | None = None,
 ) -> list[PricePlan]:
     grouped: dict[str, PriceRow] = {}
     grouped_products: dict[str, CatalogProduct] = {}
@@ -1104,7 +1105,7 @@ def plan_prices(
             if has_current or direct_wholesale or recalculate_wholesale:
                 payload["wholesale_prices"] = [{"minimal_threshold": threshold, "price": float(value)} for threshold, value in sorted(wholesale.items())]
             if has_mono:
-                mono_level_id = settings.mono_price_level_id
+                mono_level_id = mono_price_level_id if mono_price_level_id is not None else settings.mono_price_level_id
                 existing_other_levels = [
                     {"level_id": int(lvl["level_id"]), "price": float(lvl.get("price") or 0)}
                     for lvl in product.raw_price_levels
@@ -1146,6 +1147,28 @@ class HoroshopClient:
         if not token: raise HoroshopPricesError("Хорошоп не повернув токен авторизації.")
         self._token = str(token)
         return self._token
+
+    def export_price_levels(self) -> list[dict[str, Any]]:
+        try:
+            response = self._post("/api/price_levels/export/", {"token": self.token()})
+            nested = response.get("response")
+            levels = nested.get("price_levels") if isinstance(nested, dict) else response.get("price_levels")
+            if isinstance(levels, list):
+                return [lvl for lvl in levels if isinstance(lvl, dict)]
+        except Exception:
+            pass
+        return []
+
+    def resolve_mono_price_level_id(self) -> int:
+        levels = self.export_price_levels()
+        for level in levels:
+            title = normalize(level.get("title")).casefold()
+            if title in ("mono", "моно"):
+                try:
+                    return int(level.get("id"))
+                except (ValueError, TypeError):
+                    pass
+        return self.settings.mono_price_level_id
 
     def export_catalog(self) -> list[dict[str, Any]]:
         offset, products = 0, []

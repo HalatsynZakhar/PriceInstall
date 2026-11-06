@@ -13,7 +13,7 @@
     "password": "your_password",
     "batch_size": 50,
     "request_timeout_seconds": 60,
-    "mono_price_level_id": 3
+    "mono_price_level_id": 4
   },
   "wholesale_defaults": {
     "recalculate_from_rrc": true,
