@@ -3,10 +3,17 @@
     "host": "0.0.0.0",
     "port": 8095
   },
+  "auth": {
+    "username": "admin",
+    "password": "your_secure_password"
+  },
   "horoshop": {
     "domain": "https://your-shop.example.com",
+    "login": "your_login@example.com",
+    "password": "your_password",
     "batch_size": 50,
-    "request_timeout_seconds": 60
+    "request_timeout_seconds": 60,
+    "mono_price_level_id": 3
   },
   "wholesale_defaults": {
     "recalculate_from_rrc": true,

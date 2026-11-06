@@ -187,8 +187,8 @@ class HoroshopPricesTests(unittest.TestCase):
         self.assertEqual(values[5], "UNKNOWN")
         self.assertEqual(values[6], 900)
         self.assertEqual(values[8], "Видалити")
-        self.assertEqual(values[11], 800)
-        self.assertEqual(values[12], 3)
+        self.assertEqual(values[14], 800)
+        self.assertEqual(values[15], 3)
         workbook.close()
 
     def test_report_excel_contains_all_old_and_new_prices_and_display_articles(self):
@@ -208,10 +208,12 @@ class HoroshopPricesTests(unittest.TestCase):
         self.assertEqual(headers[5], "Нова поточна ціна (грн)")
         self.assertEqual(headers[6], "Стара РРЦ (грн)")
         self.assertEqual(headers[7], "Нова РРЦ (грн)")
-        self.assertEqual(headers[8], "Старий Опт 1 (грн)")
-        self.assertEqual(headers[9], "Старий Опт 1 від (шт.)")
-        self.assertEqual(headers[10], "Новий Опт 1 (грн)")
-        self.assertEqual(headers[11], "Новий Опт 1 від (шт.)")
+        self.assertEqual(headers[8], "Стара ціна МОНО (грн)")
+        self.assertEqual(headers[9], "Нова ціна МОНО (грн)")
+        self.assertEqual(headers[10], "Старий Опт 1 (грн)")
+        self.assertEqual(headers[11], "Старий Опт 1 від (шт.)")
+        self.assertEqual(headers[12], "Новий Опт 1 (грн)")
+        self.assertEqual(headers[13], "Новий Опт 1 від (шт.)")
 
         values = next(sheet.iter_rows(min_row=2, max_row=2, values_only=True))
         self.assertEqual(values[0], 3)
@@ -222,10 +224,12 @@ class HoroshopPricesTests(unittest.TestCase):
         self.assertEqual(values[5], 1200.0)
         self.assertEqual(values[6], 1000.0)
         self.assertEqual(values[7], 1200.0)
-        self.assertEqual(values[8], 900.0)
-        self.assertEqual(values[9], 2)
-        self.assertEqual(values[10], 1080.0)
+        self.assertIn(values[8], (None, ""))
+        self.assertIn(values[9], (None, ""))
+        self.assertEqual(values[10], 900.0)
         self.assertEqual(values[11], 2)
+        self.assertEqual(values[12], 1080.0)
+        self.assertEqual(values[13], 2)
         workbook.close()
 
     def test_with_report_excel_encodes_base64_report(self):
@@ -357,6 +361,122 @@ class HoroshopPricesTests(unittest.TestCase):
                 self.assertEqual(backup_mappings.targets_for("04040", False), ("04040", "TARGET-1"))
             finally:
                 price_server.MAPPINGS_FILE = original_file
+
+    def test_plan_prices_direct_mono_price(self):
+        row = PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, mono=FieldChange(Decimal("1500")))
+        plan = plan_prices([row], self.catalog(), self.settings())[0]
+        self.assertTrue(plan.ready)
+        self.assertEqual(plan.payload["price_levels"], [{"level_id": 3, "price": 1500.0}])
+
+    def test_plan_prices_delete_mono_price(self):
+        row = PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, mono=FieldChange(delete=True))
+        plan = plan_prices([row], self.catalog(), self.settings())[0]
+        self.assertTrue(plan.ready)
+        self.assertEqual(plan.payload["price_levels"], [{"level_id": 3, "price": 0}])
+        self.assertIn("Ціну МОНО видалено", "; ".join(plan.warnings))
+
+    def test_plan_prices_move_current_to_mono(self):
+        row = PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, move_current_to_mono=True)
+        plan = plan_prices([row], self.catalog(), self.settings())[0]
+        self.assertTrue(plan.ready)
+        self.assertEqual(plan.payload["price_levels"], [{"level_id": 3, "price": 1000.0}])
+        self.assertIn("Ціну МОНО скопійовано з поточної ціни", "; ".join(plan.warnings))
+
+    def test_plan_prices_move_old_to_mono(self):
+        row = PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, move_old_to_mono=True)
+        plan = plan_prices([row], self.catalog(), self.settings())[0]
+        self.assertTrue(plan.ready)
+        self.assertEqual(plan.payload["price_levels"], [{"level_id": 3, "price": 1000.0}])
+        self.assertIn("Ціну МОНО скопійовано з РРЦ", "; ".join(plan.warnings))
+
+    def test_plan_prices_preserves_other_price_levels(self):
+        catalog = CatalogIndex.from_raw([
+            {"article": "REAL-1", "article_for_display": "Display-1", "price": 1000, "price_old": 1000, "wholesale_prices": [], "price_levels": [{"level_id": 1, "price": 850.0}, {"level_id": 3, "price": 950.0}]}
+        ])
+        row = PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, mono=FieldChange(Decimal("1600")))
+        plan = plan_prices([row], catalog, self.settings())[0]
+        self.assertTrue(plan.ready)
+        self.assertEqual(plan.payload["price_levels"], [{"level_id": 1, "price": 850.0}, {"level_id": 3, "price": 1600.0}])
+
+    def test_parse_excel_mono_columns(self):
+        rows = parse_excel_prices(self.excel(
+            ["Артикул", "Ціна МОНО (грн)", "Поточну ціну в МОНО (Так)", "РРЦ в МОНО (Так)"],
+            [("ITEM-1", 1500, "", ""), ("ITEM-2", "", "Так", ""), ("ITEM-3", "", "", "Так")],
+        ))
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0].mono.value, Decimal("1500"))
+        self.assertTrue(rows[1].move_current_to_mono)
+        self.assertTrue(rows[2].move_old_to_mono)
+
+    def test_parse_excel_rejects_conflicting_mono_options(self):
+        with self.assertRaisesRegex(ValueError, "в одному рядку можна обрати лише один автоматичний перенос у МОНО"):
+            parse_excel_prices(self.excel(
+                ["Артикул", "Поточну ціну в МОНО (Так)", "РРЦ в МОНО (Так)"],
+                [("ITEM-1", "Так", "Так")],
+            ))
+        with self.assertRaisesRegex(ValueError, "не поєднуйте ціну МОНО"):
+            parse_excel_prices(self.excel(
+                ["Артикул", "Ціна МОНО (грн)", "Поточну ціну в МОНО (Так)"],
+                [("ITEM-1", 1500, "Так")],
+            ))
+
+    def test_template_contains_mono_columns(self):
+        workbook = load_workbook(io.BytesIO(build_excel_template()), read_only=True)
+        headers = [cell.value for cell in next(workbook["Ціни"].iter_rows(max_row=1))]
+        self.assertIn("Ціна МОНО (грн)", headers)
+        self.assertIn("Поточну ціну в МОНО (Так)", headers)
+        self.assertIn("РРЦ в МОНО (Так)", headers)
+        workbook.close()
+
+    def test_serialise_mono_changes(self):
+        from price_server import serialise
+        plan1 = plan_prices([PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, mono=FieldChange(Decimal("1500")))], self.catalog(), self.settings())[0]
+        self.assertIn("МОНО: 1500", serialise(plan1)["changes"])
+
+        plan2 = plan_prices([PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, mono=FieldChange(delete=True))], self.catalog(), self.settings())[0]
+        self.assertIn("МОНО: видалити", serialise(plan2)["changes"])
+
+        plan3 = plan_prices([PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, move_current_to_mono=True)], self.catalog(), self.settings())[0]
+        self.assertIn("Поточну ціну перенести в МОНО", serialise(plan3)["changes"])
+
+        plan4 = plan_prices([PriceRow("REAL-1", FieldChange(), None, FieldChange(), False, False, (), 1, move_old_to_mono=True)], self.catalog(), self.settings())[0]
+        self.assertIn("РРЦ перенести в МОНО", serialise(plan4)["changes"])
+
+    def test_http_basic_auth_in_price_server(self):
+        from fastapi import HTTPException
+        from fastapi.security import HTTPBasicCredentials
+        import price_server
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "config.json"
+            config.write_text('{"auth":{"username":"admin","password":"Bublik44"},"horoshop":{"domain":"https://shop.test","login":"test","password":"pwd"}}', encoding="utf-8")
+            s = load_settings(config)
+            old_settings = price_server.settings
+            try:
+                price_server.settings = s
+
+                with self.assertRaises(HTTPException) as ctx:
+                    price_server.verify_auth(None)
+                self.assertEqual(ctx.exception.status_code, 401)
+                self.assertIn("Basic", ctx.exception.headers.get("WWW-Authenticate", ""))
+
+                with self.assertRaises(HTTPException) as ctx:
+                    price_server.verify_auth(HTTPBasicCredentials(username="admin", password="wrong"))
+                self.assertEqual(ctx.exception.status_code, 401)
+
+                price_server.verify_auth(HTTPBasicCredentials(username="admin", password="Bublik44"))
+
+                info = price_server.server_info()
+                self.assertTrue(info["has_auth"])
+                self.assertTrue(info["has_default_credentials"])
+                self.assertEqual(info["default_login"], "test")
+
+                config_no_auth = Path(temp_dir) / "config_no_auth.json"
+                config_no_auth.write_text('{"horoshop":{"domain":"https://shop.test"}}', encoding="utf-8")
+                price_server.settings = load_settings(config_no_auth)
+                price_server.verify_auth(None)
+            finally:
+                price_server.settings = old_settings
 
 
 if __name__ == "__main__":

@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import secrets
 import sys
 import threading
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from horoshop_prices import (
     ArticleMappings, CatalogIndex, Credentials, FieldChange, HoroshopClient, HoroshopPricesError, PricePlan, PriceRow, Settings, WholesaleChange,
@@ -26,6 +28,27 @@ MAPPINGS_FILE = PROJECT_DIR / "data" / "article_mappings.json"
 settings: Settings | None = None
 logger = logging.getLogger(__name__)
 mapping_lock = threading.Lock()
+security = HTTPBasic(auto_error=False)
+
+
+def verify_auth(credentials: HTTPBasicCredentials | None = Depends(security)) -> None:
+    runtime_settings = get_settings()
+    if not runtime_settings.auth_password:
+        return
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Необхідна авторизація.",
+            headers={"WWW-Authenticate": 'Basic realm="PriceInstall"'},
+        )
+    user_ok = secrets.compare_digest(credentials.username.encode("utf-8"), runtime_settings.auth_username.encode("utf-8"))
+    pass_ok = secrets.compare_digest(credentials.password.encode("utf-8"), runtime_settings.auth_password.encode("utf-8"))
+    if not (user_ok and pass_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Невірний логін або пароль.",
+            headers={"WWW-Authenticate": 'Basic realm="PriceInstall"'},
+        )
 
 
 class PublicLogStream:
@@ -74,15 +97,20 @@ def configure_service_output(runtime_settings: Settings) -> None:
 
 
 def credentials_from(data: dict[str, Any]) -> Credentials:
-    credentials = Credentials(normalize(data.get("login")), normalize(data.get("password")), normalize(data.get("token")))
+    runtime_settings = get_settings()
+    login = normalize(data.get("login")) or runtime_settings.default_login
+    password = normalize(data.get("password")) or runtime_settings.default_password
+    token = normalize(data.get("token")) or runtime_settings.default_token
+    credentials = Credentials(login, password, token)
     if not credentials.token and (not credentials.login or not credentials.password):
         raise HoroshopPricesError("Вкажіть логін і пароль API або чинний токен.")
     return credentials
 
 
 def catalog_for(credentials: Credentials) -> tuple[CatalogIndex, HoroshopClient]:
-    client = HoroshopClient(get_settings(), credentials)
-    return CatalogIndex.from_raw(client.export_catalog()), client
+    runtime_settings = get_settings()
+    client = HoroshopClient(runtime_settings, credentials)
+    return CatalogIndex.from_raw(client.export_catalog(), mono_price_level_id=runtime_settings.mono_price_level_id), client
 
 
 def serialise(plan: PricePlan, status: str | None = None, message: str = "") -> dict[str, Any]:
@@ -102,6 +130,14 @@ def serialise(plan: PricePlan, status: str | None = None, message: str = "") -> 
         changes.append("Поточну ціну перенести в РРЦ")
     if row.move_old_to_current:
         changes.append("РРЦ перенести в поточну ціну")
+    if row.mono.value is not None:
+        changes.append(f"МОНО: {row.mono.value}")
+    elif row.mono.delete:
+        changes.append("МОНО: видалити")
+    if row.move_current_to_mono:
+        changes.append("Поточну ціну перенести в МОНО")
+    if row.move_old_to_mono:
+        changes.append("РРЦ перенести в МОНО")
     for wholesale in row.wholesale:
         label = f"Опт {wholesale.tier}" + (f" від {wholesale.threshold} шт." if wholesale.threshold else "")
         changes.append(label + (": видалити" if wholesale.change.delete else f": {wholesale.change.value}"))
@@ -124,7 +160,11 @@ def with_failed_excel(result: dict[str, Any], failures: list[tuple[PricePlan, st
 
 def with_report_excel(result: dict[str, Any], plans: list[PricePlan], filename: str = "horoshop_prices_report.xlsx") -> dict[str, Any]:
     if plans:
-        result["report_excel"] = base64.b64encode(build_report_excel(plans)).decode("ascii")
+        try:
+            mono_id = get_settings().mono_price_level_id
+        except Exception:
+            mono_id = 3
+        result["report_excel"] = base64.b64encode(build_report_excel(plans, mono_level_id=mono_id)).decode("ascii")
         result["report_excel_name"] = filename
     return result
 
@@ -219,13 +259,26 @@ async def uploaded_rows(request: Request) -> tuple[list[PriceRow], Credentials, 
     return parse_excel_prices(contents), credentials_from(dict(form)), parse_bool(form.get("normalize_articles"), True), mappings
 
 
-app = FastAPI(title="Ціни Хорошоп")
+app = FastAPI(title="Ціни Хорошоп", dependencies=[Depends(verify_auth)])
 
 
 @app.exception_handler(Exception)
-async def unexpected_error(_: Request, error: Exception) -> JSONResponse:
+async def unexpected_error(_: Request, error: Exception) -> Response:
+    if isinstance(error, HTTPException):
+        return JSONResponse(status_code=error.status_code, content={"detail": error.detail}, headers=error.headers)
     logger.exception("Unhandled web request error", exc_info=error)
     return JSONResponse(status_code=500, content={"detail": "Внутрішня помилка сервера. Перевірте публічний лог."})
+
+
+@app.get("/api/info")
+def server_info() -> dict[str, Any]:
+    runtime_settings = get_settings()
+    has_defaults = bool(runtime_settings.default_token or (runtime_settings.default_login and runtime_settings.default_password))
+    return {
+        "has_default_credentials": has_defaults,
+        "default_login": runtime_settings.default_login,
+        "has_auth": bool(runtime_settings.auth_password),
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -326,19 +379,30 @@ async def one_price(request: Request) -> dict[str, Any]:
         delete = raw_value.casefold() in {"видалити", "delete"}
         if delete and price_type == "price":
             raise ValueError("Поточну ціну не можна видалити. Вкажіть нове значення.")
-        value = None if delete else (parse_decimal(raw_value) if raw_value else None)
-        percent = parse_decimal(raw_percent, "Відсоток від РРЦ") if raw_percent else None
-        if percent is not None and not Decimal("1") <= percent <= Decimal("100"):
-            raise ValueError("Відсоток від РРЦ має бути від 1 до 100.")
-        if value is None and percent is None and not delete:
-            raise ValueError("Вкажіть суму в грн, відсоток від РРЦ або «Видалити».")
-        if percent is not None and price_type != "price":
-            raise ValueError("Відсоток від РРЦ доступний лише для поточної ціни.")
+        if price_type in ("move_current_to_mono", "move_old_to_mono"):
+            value = None
+            percent = None
+            delete = False
+        else:
+            value = None if delete else (parse_decimal(raw_value) if raw_value else None)
+            percent = parse_decimal(raw_percent, "Відсоток від РРЦ") if raw_percent else None
+            if percent is not None and not Decimal("1") <= percent <= Decimal("100"):
+                raise ValueError("Відсоток від РРЦ має бути від 1 до 100.")
+            if value is None and percent is None and not delete:
+                raise ValueError("Вкажіть суму в грн, відсоток від РРЦ або «Видалити».")
+            if percent is not None and price_type != "price":
+                raise ValueError("Відсоток від РРЦ доступний лише для поточної ціни.")
         threshold = parse_threshold(data.get("threshold"))
         current = FieldChange(value=value) if price_type == "price" else FieldChange()
         old = FieldChange(value=value, delete=delete) if price_type == "price_old" else FieldChange()
+        mono = FieldChange(value=value, delete=delete) if price_type == "mono" else FieldChange()
+        move_to_mono = price_type == "move_current_to_mono"
+        move_old_to_mono = price_type == "move_old_to_mono"
         wholesale = () if not price_type.startswith("wholesale_") else (WholesaleChange(int(price_type.rsplit("_", 1)[1]), FieldChange(value=value, delete=delete), threshold),)
-        row = PriceRow(normalize(data.get("article")), current, percent, old, False, False, wholesale, 1)
+        row = PriceRow(
+            normalize(data.get("article")), current, percent, old, False, False, wholesale, 1,
+            mono=mono, move_current_to_mono=move_to_mono, move_old_to_mono=move_old_to_mono,
+        )
         return await asyncio.to_thread(execute_rows, [row], credentials_from(data), parse_bool(data.get("normalize_articles"), True), stored_mappings())
     except (HoroshopPricesError, ValueError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

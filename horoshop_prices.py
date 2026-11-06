@@ -20,6 +20,9 @@ PUBLIC_LOG_PATH_JSON_PATTERN = re.compile(r'("public_log_path"\s*:\s*")(?P<value
 PRICE_TYPES = {
     "поточна ціна": "price", "ціна": "price", "price": "price", "current": "price", "акційна ціна": "price",
     "ррц": "price_old", "стара ціна": "price_old", "old price": "price_old", "price_old": "price_old",
+    "моно": "mono", "ціна моно": "mono", "mono": "mono", "price_mono": "mono",
+    "поточну ціну в моно": "move_current_to_mono", "ціну сайту в моно": "move_current_to_mono", "ціну в моно": "move_current_to_mono",
+    "ррц в моно": "move_old_to_mono",
     "опт 1": "wholesale_1", "оптова ціна 1": "wholesale_1", "wholesale 1": "wholesale_1",
     "опт 2": "wholesale_2", "оптова ціна 2": "wholesale_2", "wholesale 2": "wholesale_2",
     "опт 3": "wholesale_3", "оптова ціна 3": "wholesale_3", "wholesale 3": "wholesale_3",
@@ -50,6 +53,12 @@ class Settings:
     public_log_name: str
     wholesale_rules: tuple[WholesaleRule, ...]
     recalculate_wholesale_from_rrc: bool
+    default_login: str = ""
+    default_password: str = ""
+    default_token: str = ""
+    auth_username: str = ""
+    auth_password: str = ""
+    mono_price_level_id: int = 3
 
     @property
     def public_log_file(self) -> Path:
@@ -90,6 +99,9 @@ class PriceRow:
     move_old_to_current: bool
     wholesale: tuple[WholesaleChange, ...]
     row_number: int
+    mono: FieldChange = FieldChange()
+    move_current_to_mono: bool = False
+    move_old_to_mono: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,6 +111,8 @@ class CatalogProduct:
     price: Decimal | None
     price_old: Decimal | None
     wholesale_prices: tuple[dict[str, Any], ...]
+    price_mono: Decimal | None = None
+    raw_price_levels: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -178,7 +192,7 @@ def parse_price_type(value: Any) -> str:
     key = normalize(value).casefold()
     price_type = PRICE_TYPES.get(key)
     if not price_type:
-        raise ValueError("невідомий тип ціни. Використайте: Поточна ціна, РРЦ або Опт 1-5.")
+        raise ValueError("невідомий тип ціни. Використайте: Поточна ціна, РРЦ, МОНО, Поточну ціну в МОНО, РРЦ в МОНО або Опт 1-5.")
     return price_type
 
 
@@ -233,12 +247,28 @@ def load_settings(config_file: Path) -> Settings:
     name = normalize(logging_config.get("public_log_name", "horoshop_prices.log")) or "horoshop_prices.log"
     if Path(name).name != name:
         raise ValueError("logging.public_log_name має бути лише назвою файлу.")
+    auth_config = raw.get("auth") or server.get("auth") or {}
+    auth_pass = normalize(auth_config.get("password") or raw.get("admin_password"))
+    auth_user = normalize(auth_config.get("username") or raw.get("admin_username") or ("admin" if auth_pass else ""))
+
+    mono_level_raw = horoshop.get("mono_price_level_id", horoshop.get("mono_level_id", 3))
+    try:
+        mono_level_id = int(mono_level_raw)
+    except (ValueError, TypeError):
+        mono_level_id = 3
+
     return Settings(
         domain=domain.rstrip("/"), host=normalize(server.get("host", "0.0.0.0")) or "0.0.0.0",
         port=max(1, min(65535, int(server.get("port", 8095)))), batch_size=max(1, int(horoshop.get("batch_size", 50))),
         request_timeout_seconds=max(1, int(horoshop.get("request_timeout_seconds", 60))), public_log_path=path, public_log_name=name,
         wholesale_rules=tuple(sorted(rules, key=lambda rule: rule.tier)),
         recalculate_wholesale_from_rrc=bool(prices.get("recalculate_from_rrc", prices.get("recalculate_on_current_price", True))) if isinstance(prices, dict) else True,
+        default_login=normalize(horoshop.get("login")),
+        default_password=normalize(horoshop.get("password")),
+        default_token=normalize(horoshop.get("token")),
+        auth_username=auth_user,
+        auth_password=auth_pass,
+        mono_price_level_id=mono_level_id,
     )
 
 
@@ -313,7 +343,15 @@ def parse_yes(value: Any, label: str) -> bool:
 
 def column_map(headers: tuple[Any, ...]) -> dict[str, int]:
     mapping: dict[str, int] = {}
-    aliases = {"поточна ціна": "price", "поточна ціна (грн)": "price", "поточна ціна, % від ррц": "percent", "поточна ціна (% від ррц)": "percent", "ррц": "old", "ррц (грн)": "old", "поточну ціну в ррц (так)": "move", "ррц в поточну ціну (так)": "restore"}
+    aliases = {
+        "поточна ціна": "price", "поточна ціна (грн)": "price", "поточна ціна, % від ррц": "percent", "поточна ціна (% від ррц)": "percent",
+        "ррц": "old", "ррц (грн)": "old", "поточну ціну в ррц (так)": "move", "ррц в поточну ціну (так)": "restore",
+        "ціна моно": "mono", "ціна моно (грн)": "mono", "моно": "mono", "моно (грн)": "mono", "mono": "mono", "mono (грн)": "mono",
+        "поточну ціну в моно (так)": "move_to_mono", "поточну ціну в моно": "move_to_mono",
+        "ціну сайту в моно (так)": "move_to_mono", "ціну сайту в моно": "move_to_mono",
+        "ціну в моно (так)": "move_to_mono", "ціну в моно": "move_to_mono",
+        "ррц в моно (так)": "move_old_to_mono", "ррц в моно": "move_old_to_mono",
+    }
     for tier in range(1, 6):
         aliases[f"опт {tier}"] = f"wholesale_{tier}"
         aliases[f"опт {tier} (грн)"] = f"wholesale_{tier}"
@@ -378,6 +416,15 @@ def parse_excel_prices(data: bytes) -> list[PriceRow]:
                     raise ValueError("не поєднуйте перенесення РРЦ у поточну ціну з відсотком від РРЦ.")
                 if percent is not None and old.delete:
                     raise ValueError("не можна видаляти РРЦ, з якого обчислюється поточна ціна.")
+                mono = parse_change(cell(row, mapping, "mono"), "Ціна МОНО")
+                move_to_mono = parse_yes(cell(row, mapping, "move_to_mono"), "Поточну ціну в МОНО (Так)")
+                move_old_to_mono = parse_yes(cell(row, mapping, "move_old_to_mono"), "РРЦ в МОНО (Так)")
+                if move_to_mono and move_old_to_mono:
+                    raise ValueError("в одному рядку можна обрати лише один автоматичний перенос у МОНО.")
+                if move_to_mono and mono.specified:
+                    raise ValueError("не поєднуйте ціну МОНО та «Поточну ціну в МОНО (Так)» в одному рядку.")
+                if move_old_to_mono and mono.specified:
+                    raise ValueError("не поєднуйте ціну МОНО та «РРЦ в МОНО (Так)» в одному рядку.")
                 wholesale: list[WholesaleChange] = []
                 for tier in range(1, 6):
                     change = parse_change(cell(row, mapping, f"wholesale_{tier}"), f"Опт {tier}")
@@ -386,9 +433,12 @@ def parse_excel_prices(data: bytes) -> list[PriceRow]:
                         raise ValueError(f"для Опт {tier} задано кількість без ціни або команди «Видалити».")
                     if change.specified:
                         wholesale.append(WholesaleChange(tier, change, threshold))
-                if not current.specified and percent is None and not old.specified and not move and not restore and not wholesale:
+                if not current.specified and percent is None and not old.specified and not move and not restore and not wholesale and not mono.specified and not move_to_mono and not move_old_to_mono:
                     continue
-                rows.append(PriceRow(article, current, percent, old, move, restore, tuple(wholesale), row_number))
+                rows.append(PriceRow(
+                    article, current, percent, old, move, restore, tuple(wholesale), row_number,
+                    mono=mono, move_current_to_mono=move_to_mono, move_old_to_mono=move_old_to_mono,
+                ))
             except ValueError as error:
                 raise ValueError(f"Рядок {row_number}: {error}") from error
         if not rows:
@@ -510,6 +560,9 @@ def price_row_excel_values(row: PriceRow) -> list[Any]:
         "Видалити" if row.old.delete else (float(row.old.value) if row.old.value is not None else ""),
         "Так" if row.move_current_to_old else "",
         "Так" if row.move_old_to_current else "",
+        "Видалити" if row.mono.delete else (float(row.mono.value) if row.mono.value is not None else ""),
+        "Так" if row.move_current_to_mono else "",
+        "Так" if row.move_old_to_mono else "",
     ]
     by_tier = {item.tier: item for item in row.wholesale}
     for tier in range(1, 6):
@@ -525,7 +578,11 @@ def build_failed_excel(failures: list[tuple[PricePlan, str, str]]) -> bytes:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Не встановлено"
-    headers = ["Статус", "Помилка", "Внутрішній артикул Хорошоп", "Артикул для відображення", "Рядок", "Артикул користувача", "Поточна ціна (грн)", "Поточна ціна (% від РРЦ)", "РРЦ (грн)", "Поточну ціну в РРЦ (Так)", "РРЦ в поточну ціну (Так)"]
+    headers = [
+        "Статус", "Помилка", "Внутрішній артикул Хорошоп", "Артикул для відображення", "Рядок", "Артикул користувача",
+        "Поточна ціна (грн)", "Поточна ціна (% від РРЦ)", "РРЦ (грн)", "Поточну ціну в РРЦ (Так)", "РРЦ в поточну ціну (Так)",
+        "Ціна МОНО (грн)", "Поточну ціну в МОНО (Так)", "РРЦ в МОНО (Так)",
+    ]
     for tier in range(1, 6):
         headers.extend([f"Опт {tier} (грн)", f"Опт {tier} від (шт.)"])
     sheet.append(headers)
@@ -536,10 +593,11 @@ def build_failed_excel(failures: list[tuple[PricePlan, str, str]]) -> bytes:
         sheet.append([status, message, plan.article, plan.display_article] + price_row_excel_values(row))
     widths = {
         "A": 14, "B": 56, "C": 26, "D": 26, "E": 10, "F": 28, "G": 18, "H": 24, "I": 14, "J": 26, "K": 26,
+        "L": 18, "M": 26, "N": 26,
     }
     for column, width in widths.items():
         sheet.column_dimensions[column].width = width
-    for index in range(12, len(headers) + 1):
+    for index in range(15, len(headers) + 1):
         sheet.column_dimensions[sheet.cell(row=1, column=index).column_letter].width = 14
     _style_header(sheet)
     for row in sheet.iter_rows(min_row=2):
@@ -566,7 +624,7 @@ def _extract_wholesale_pairs(wholesale_data: Any) -> list[tuple[float, int]]:
     return pairs
 
 
-def build_report_excel(plans: list[PricePlan]) -> bytes:
+def build_report_excel(plans: list[PricePlan], mono_level_id: int = 3) -> bytes:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Детальний звіт цін"
@@ -579,6 +637,8 @@ def build_report_excel(plans: list[PricePlan]) -> bytes:
         "Нова поточна ціна (грн)",
         "Стара РРЦ (грн)",
         "Нова РРЦ (грн)",
+        "Стара ціна МОНО (грн)",
+        "Нова ціна МОНО (грн)",
     ]
     for tier in range(1, 6):
         headers.extend([
@@ -609,6 +669,15 @@ def build_report_excel(plans: list[PricePlan]) -> bytes:
         else:
             new_rrc = old_rrc
 
+        old_mono = float(product.price_mono) if product and product.price_mono is not None else ""
+        new_mono = old_mono
+        if "price_levels" in plan.payload:
+            for lvl in plan.payload["price_levels"]:
+                if isinstance(lvl, dict) and lvl.get("level_id") == mono_level_id:
+                    p = lvl.get("price")
+                    new_mono = "Видалено" if p == 0 else float(p)
+                    break
+
         old_wholesale_pairs = _extract_wholesale_pairs(product.wholesale_prices) if product else []
         if "wholesale_prices" in plan.payload:
             new_wholesale_pairs = _extract_wholesale_pairs(plan.payload["wholesale_prices"])
@@ -634,6 +703,11 @@ def build_report_excel(plans: list[PricePlan]) -> bytes:
                 changes.append(f"РРЦ: {old_rrc} -> {new_rrc}")
             else:
                 changes.append(f"РРЦ: {new_rrc}")
+        if "price_levels" in plan.payload:
+            if old_mono != "" and old_mono != new_mono:
+                changes.append(f"МОНО: {old_mono} -> {new_mono}")
+            elif new_mono != "":
+                changes.append(f"МОНО: {new_mono}")
         if "wholesale_prices" in plan.payload:
             changes.append("Опт оновлено")
 
@@ -646,17 +720,19 @@ def build_report_excel(plans: list[PricePlan]) -> bytes:
             new_current,
             old_rrc,
             new_rrc,
+            old_mono,
+            new_mono,
         ] + wholesale_values + [
             "; ".join(changes),
             "; ".join(plan.warnings),
         ])
 
     widths: dict[str, int] = {
-        "A": 10, "B": 24, "C": 26, "D": 26, "E": 20, "F": 20, "G": 16, "H": 16,
+        "A": 10, "B": 24, "C": 26, "D": 26, "E": 20, "F": 20, "G": 16, "H": 16, "I": 18, "J": 18,
     }
     for column, width in widths.items():
         sheet.column_dimensions[column].width = width
-    for index in range(9, len(headers) - 1):
+    for index in range(11, len(headers) - 1):
         sheet.column_dimensions[sheet.cell(row=1, column=index).column_letter].width = 16
     sheet.column_dimensions[sheet.cell(row=1, column=len(headers) - 1).column_letter].width = 35
     sheet.column_dimensions[sheet.cell(row=1, column=len(headers)).column_letter].width = 45
@@ -683,18 +759,35 @@ def build_excel_template() -> bytes:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Ціни"
-    headers = ["Артикул", "Поточна ціна (грн)", "Поточна ціна (% від РРЦ)", "РРЦ (грн)", "Поточну ціну в РРЦ (Так)", "РРЦ в поточну ціну (Так)"]
+    headers = [
+        "Артикул",
+        "Поточна ціна (грн)",
+        "Поточна ціна (% від РРЦ)",
+        "РРЦ (грн)",
+        "Поточну ціну в РРЦ (Так)",
+        "РРЦ в поточну ціну (Так)",
+        "Ціна МОНО (грн)",
+        "Поточну ціну в МОНО (Так)",
+        "РРЦ в МОНО (Так)",
+    ]
     for tier in range(1, 6):
         headers.extend([f"Опт {tier} (грн)", f"Опт {tier} від (шт.)"])
     sheet.append(headers)
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = "A1:P1"
-    for column, width in {"A": 28, "B": 16, "C": 24, "D": 16, "E": 28, "F": 28, "G": 14, "H": 14, "I": 14, "J": 14, "K": 14, "L": 14, "M": 14, "N": 14, "O": 14, "P": 14}.items():
+    end_col_letter = sheet.cell(row=1, column=len(headers)).column_letter
+    sheet.auto_filter.ref = f"A1:{end_col_letter}1"
+    widths = {
+        "A": 28, "B": 16, "C": 24, "D": 16, "E": 28, "F": 28,
+        "G": 18, "H": 28, "I": 28,
+    }
+    for column, width in widths.items():
         sheet.column_dimensions[column].width = width
+    for col_idx in range(10, len(headers) + 1):
+        sheet.column_dimensions[sheet.cell(row=1, column=col_idx).column_letter].width = 14
     _style_header(sheet)
-    examples = [("01063", "", 75, "", "Так", "", "", "", "", "", "", "", 650, 20, "", "")]
+    examples = [("01063", "", 75, "", "Так", "", 800, "", "", "", "", "", "", "", "", "", "", "", "")]
     for row in examples:
-        sheet.append(row)
+        sheet.append(row[:len(headers)])
     for row in range(2, 202):
         sheet.cell(row=row, column=1).number_format = "@"
     guide = workbook.create_sheet("Інструкція")
@@ -706,10 +799,13 @@ def build_excel_template() -> bytes:
     notes = [
         "Один рядок = один товар. Кожен стовпець керує окремою ціною цього товару.",
         "Артикул можна вказати як article_for_display зі сайту або внутрішній article Хорошоп. Пошук: точний, потім без урахування регістру.",
-        "Порожня клітинка означає «не змінювати». Видалення виконується тільки словом «Видалити» у клітинці РРЦ або потрібного Опт 1-5.",
+        "Порожня клітинка означає «не змінювати». Видалення виконується тільки словом «Видалити» у клітинці РРЦ, МОНО або потрібного Опт 1-5.",
         "«Поточна ціна, % від РРЦ»: вкажіть число від 1 до 100, у тому числі дробове. Поточна ціна = РРЦ × відсоток / 100 з округленням до цілої гривні вниз.",
         "«Поточну ціну в РРЦ (Так)»: коли вказано нову поточну ціну, попередня поточна ціна буде записана в РРЦ. Не заповнюйте при цьому стовпець РРЦ.",
         "«РРЦ в поточну ціну (Так)» копіює наявне РРЦ у поточну ціну. Щоб одночасно прибрати РРЦ, напишіть «Видалити» у стовпці РРЦ.",
+        "«Ціна МОНО (грн)»: встановлює фіксовану ціну для типу цін МОНО. Щоб прибрати ціну МОНО, напишіть «Видалити».",
+        "«Поточну ціну в МОНО (Так)»: копіює поточну ціну сайту (або нову вказану поточну ціну) в ціну МОНО.",
+        "«РРЦ в МОНО (Так)»: копіює РРЦ сайту (або нове вказане РРЦ) у ціну МОНО.",
         "Опт 1-3 розраховується від РРЦ/старої ціни за правилами 2 шт. -10%, 5 шт. -15%, 10 шт. -25%. Правила можна змінити у config.json.",
         "Акційна ціна не зменшує опт. Оптові ціни, які не нижчі за поточну ціну, автоматично виключаються. Інші наявні рівні опта зберігаються.",
         "Для будь-якого Опт 1-5 можна вказати «Кількість від». Якщо для Опт 1-3 вона порожня, поріг береться з config.json. Для Опт 4-5 кількість обов'язкова.",
@@ -808,16 +904,25 @@ class CatalogIndex:
                     self.by_normalized.setdefault(normalized.casefold(), []).append(item)
 
     @classmethod
-    def from_raw(cls, raw_products: list[dict[str, Any]]) -> "CatalogIndex":
+    def from_raw(cls, raw_products: list[dict[str, Any]], mono_price_level_id: int = 3) -> "CatalogIndex":
         products: list[CatalogProduct] = []
         for raw in raw_products:
             article = normalize(raw.get("article")) if isinstance(raw, dict) else ""
             if not article:
                 continue
             wholesale = raw.get("wholesale_prices", [])
+            raw_levels = raw.get("price_levels", [])
+            raw_price_levels = tuple(item for item in raw_levels if isinstance(item, dict)) if isinstance(raw_levels, list) else ()
+            price_mono = None
+            for level in raw_price_levels:
+                if level.get("level_id") == mono_price_level_id:
+                    price_mono = decimal_or_none(level.get("price"))
+                    break
             products.append(CatalogProduct(
                 article, normalize(raw.get("article_for_display")), decimal_or_none(raw.get("price")), decimal_or_none(raw.get("price_old")),
                 tuple(item for item in wholesale if isinstance(item, dict)) if isinstance(wholesale, list) else (),
+                price_mono=price_mono,
+                raw_price_levels=raw_price_levels,
             ))
         return cls(products)
 
@@ -941,9 +1046,32 @@ def plan_prices(
         if row.move_old_to_current and product.price_old is None:
             plans.append(PricePlan(article, product.display_article or article, {}, (row,), error="Немає РРЦ, яке можна перенести в поточну ціну."))
             continue
-        if current is None:
+        if current is None and not (row.mono.specified and not row.move_current_to_mono):
             plans.append(PricePlan(article, product.display_article or article, {}, (row,), error="Немає поточної ціни: спочатку встановіть «Поточна ціна«."))
             continue
+
+        has_mono = row.mono.specified or row.move_current_to_mono or row.move_old_to_mono
+        mono_price: Decimal | None = None
+        mono_delete = False
+
+        if row.move_current_to_mono:
+            if current is None:
+                plans.append(PricePlan(article, product.display_article or article, {}, (row,), error="Немає поточної ціни для копіювання в МОНО."))
+                continue
+            mono_price = current
+            warnings.append(f"Ціну МОНО скопійовано з поточної ціни ({mono_price} грн).")
+        elif row.move_old_to_mono:
+            if old is None:
+                plans.append(PricePlan(article, product.display_article or article, {}, (row,), error="Немає РРЦ для копіювання в МОНО."))
+                continue
+            mono_price = old
+            warnings.append(f"Ціну МОНО скопійовано з РРЦ ({mono_price} грн).")
+        elif row.mono.delete:
+            mono_delete = True
+            warnings.append("Ціну МОНО видалено.")
+        elif row.mono.value is not None:
+            mono_price = row.mono.value
+
         recalculate_wholesale = (has_current or has_old) and settings.recalculate_wholesale_from_rrc and old is not None
         if recalculate_wholesale:
             for rule in settings.wholesale_rules:
@@ -965,7 +1093,7 @@ def plan_prices(
             else:
                 wholesale[threshold] = wholesale_change.change.value  # type: ignore[index]
         else:
-            invalid = [threshold for threshold, value in wholesale.items() if value >= current]
+            invalid = [threshold for threshold, value in wholesale.items() if current is not None and value >= current]
             for threshold in invalid:
                 del wholesale[threshold]
             if invalid:
@@ -975,6 +1103,17 @@ def plan_prices(
             if has_old: payload["price_old"] = float(old) if old else 0
             if has_current or direct_wholesale or recalculate_wholesale:
                 payload["wholesale_prices"] = [{"minimal_threshold": threshold, "price": float(value)} for threshold, value in sorted(wholesale.items())]
+            if has_mono:
+                mono_level_id = settings.mono_price_level_id
+                existing_other_levels = [
+                    {"level_id": int(lvl["level_id"]), "price": float(lvl.get("price") or 0)}
+                    for lvl in product.raw_price_levels
+                    if isinstance(lvl, dict) and "level_id" in lvl and int(lvl["level_id"]) != mono_level_id
+                ]
+                if mono_delete:
+                    payload["price_levels"] = existing_other_levels + [{"level_id": mono_level_id, "price": 0}]
+                else:
+                    payload["price_levels"] = existing_other_levels + [{"level_id": mono_level_id, "price": float(mono_price)}]
             plans.append(PricePlan(article, product.display_article or article, payload, (row,), tuple(warnings), catalog_product=product))
     return sorted(plans, key=lambda plan: min(row.row_number for row in plan.rows))
 
@@ -1011,7 +1150,7 @@ class HoroshopClient:
     def export_catalog(self) -> list[dict[str, Any]]:
         offset, products = 0, []
         while True:
-            response = self._post("/api/catalog/export/", {"token": self.token(), "offset": offset, "limit": DEFAULT_EXPORT_LIMIT, "includedParams": ["article_for_display", "price", "price_old", "wholesale_prices"]})
+            response = self._post("/api/catalog/export/", {"token": self.token(), "offset": offset, "limit": DEFAULT_EXPORT_LIMIT, "includedParams": ["article_for_display", "price", "price_old", "wholesale_prices", "price_levels"]})
             nested = response.get("response")
             page = nested.get("products") if isinstance(nested, dict) else response.get("products")
             if not isinstance(page, list): raise HoroshopPricesError("Експорт каталогу не містить товарів.")
