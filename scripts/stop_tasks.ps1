@@ -35,6 +35,14 @@ function Stop-ProjectProcesses {
         Write-Output "Stopped $($process.Name), PID $($process.ProcessId)."
         $script:stopped++
     }
+
+    try {
+        $allPids = [System.Collections.Generic.HashSet[int]]::new()
+        Get-Process | ForEach-Object { [void]$allPids.Add($_.Id) }
+        Get-CimInstance Win32_Process -Filter "Name = 'conhost.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { !$allPids.Contains($_.ParentProcessId) } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch {}
 }
 
 try {

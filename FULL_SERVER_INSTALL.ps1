@@ -105,12 +105,24 @@ function Stop-ExistingRuntime {
         Write-Output "Stopped existing process: $($_.Name), PID $($_.ProcessId)."
     }
     Remove-Item -LiteralPath (Join-Path $InstallDir "logs\horoshop_prices.pid") -Force -ErrorAction SilentlyContinue
+
+    try {
+        $allPids = [System.Collections.Generic.HashSet[int]]::new()
+        Get-Process | ForEach-Object { [void]$allPids.Add($_.Id) }
+        Get-CimInstance Win32_Process -Filter "Name = 'conhost.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { !$allPids.Contains($_.ParentProcessId) } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch {}
 }
 
 function Grant-ProjectAccess {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     & icacls.exe $InstallDir /grant "*S-1-5-18:(OI)(CI)M" /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Could not grant SYSTEM access to $InstallDir." }
+
+    # Забезпечуємо наявність Desktop папок системного профілю для уникнення 0xC0000142
+    New-Item -ItemType Directory -Path "C:\Windows\System32\config\systemprofile\Desktop" -Force -ErrorAction SilentlyContinue | Out-Null
+    New-Item -ItemType Directory -Path "C:\Windows\SysWOW64\config\systemprofile\Desktop" -Force -ErrorAction SilentlyContinue | Out-Null
 }
 
 function Initialize-Configuration {

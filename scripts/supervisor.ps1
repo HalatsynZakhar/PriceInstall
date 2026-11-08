@@ -193,6 +193,14 @@ function Start-Worker {
     if (!(Test-Path $ServerScript)) { throw "Server file was not found: $ServerScript" }
 
     New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null
+    try {
+        $allPids = [System.Collections.Generic.HashSet[int]]::new()
+        Get-Process | ForEach-Object { [void]$allPids.Add($_.Id) }
+        Get-CimInstance Win32_Process -Filter "Name = 'conhost.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { !$allPids.Contains($_.ParentProcessId) } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch {}
+
     $script:Worker = Start-Process `
         -FilePath $PythonExe `
         -ArgumentList "`"$ServerScript`"" `
@@ -205,7 +213,7 @@ function Start-Worker {
     Start-Sleep -Seconds 2
     $script:Worker.Refresh()
     if ($script:Worker.HasExited) {
-        $exitCode = $script:Worker.ExitCode
+        $exitCode = try { $script:Worker.ExitCode } catch { $null }
         $script:Worker = $null
         Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
         $details = if (Test-Path $WorkerErrorLog) {
